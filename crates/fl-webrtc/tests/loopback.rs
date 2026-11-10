@@ -123,6 +123,8 @@ fn status(port: u16) -> String {
 #[derive(Default)]
 struct Received {
     connected: AtomicBool,
+    /// The streamer closed the connection.
+    closed: AtomicBool,
     video_frames: AtomicUsize,
     audio_packets: AtomicUsize,
     /// The first video frame, as it came out of the depacketizer.
@@ -187,6 +189,10 @@ impl Viewer {
                         } else {
                             r.audio_packets.fetch_add(1, Ordering::SeqCst);
                         }
+                        continue;
+                    }
+                    Output::Event(Event::Closed) => {
+                        r.closed.store(true, Ordering::SeqCst);
                         continue;
                     }
                     Output::Event(_) => continue,
@@ -356,6 +362,9 @@ fn viewers_share_one_stream_from_first_offer_to_shutdown() {
         2,
         "shutdown stops the source"
     );
+    eventually("the viewer to be told", s(2), || {
+        third.received.closed.load(Ordering::SeqCst)
+    });
     drop(third);
     let again = start(port, &seen);
     assert!(status(port).contains("\"viewers\":0"));

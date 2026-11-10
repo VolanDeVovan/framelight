@@ -118,7 +118,9 @@ async function connect() {
 
 async function showStatus() {
   try {
-    const s = await (await fetch("/status")).json();
+    // A headset that is asleep does not answer at all: do not wait for the TCP timeout.
+    const signal = AbortSignal.timeout ? AbortSignal.timeout(3000) : undefined;
+    const s = await (await fetch("/status", { signal })).json();
     const rate = $("rate");
     if (![...rate.options].some((o) => +o.value === s.ceiling_kbps)) {
       // Started with a ceiling that is not one of the presets.
@@ -130,10 +132,15 @@ async function showStatus() {
 }
 
 async function poll() {
-  if (!pc || pc.connectionState !== "connected") return;
+  if (!pc) return;
+  const mine = generation;
   let v = null;
-  (await pc.getStats()).forEach((r) => { if (r.type === "inbound-rtp" && r.kind === "video") v = r; });
-  // No packet yet means no stats entry yet: the same as nothing decoded.
+  if (pc.connectionState === "connected") {
+    (await pc.getStats()).forEach((r) => { if (r.type === "inbound-rtp" && r.kind === "video") v = r; });
+  }
+  if (mine !== generation) return;
+  // Not connected (yet, or any more), or no packet yet and so no stats entry: the same
+  // as nothing decoded, and it counts as a stall like a frozen picture does.
   if (!v) v = { framesDecoded: 0, bytesReceived: 0 };
   const now = performance.now();
   const s = window.flStats;
@@ -153,7 +160,9 @@ async function poll() {
     $("stats").textContent = `${s.width}×${s.height} · ${s.fps || 0} fps · ${((s.kbps || 0) / 1000).toFixed(1)} Mbit/s · buffer ${s.bufferMs || 0} ms`;
   } else {
     const st = await showStatus();
-    if (st && st.source === "failed") note("Waiting for the headset", st.error);
+    if (mine !== generation) return;
+    if (!st) { if (stalledFor >= 2) note("Cannot reach the headset", "Streaming may be switched off. Trying again…"); }
+    else if (st.source === "failed") note("Waiting for the headset", st.error);
     else if (stalledFor >= 2) note("Waiting for the picture…", "");
     // The picture should be flowing and is not (or the streamer is gone): start over.
     if (stalledFor > 8 && (!st || st.source === "running")) connect();
@@ -189,7 +198,13 @@ addEventListener("pageshow", (e) => { if (e.persisted) connect(); });
 wake();
 showStatus();
 connect();
-setInterval(poll, 1000);
+// One poll at a time: a slow answer must not let them pile up.
+let polling = false;
+setInterval(async () => {
+  if (polling) return;
+  polling = true;
+  try { await poll(); } catch (_) {} finally { polling = false; }
+}, 1000);
 </script>
 </body>
 </html>

@@ -151,6 +151,19 @@ impl Hub {
 
     fn close(&mut self) {
         for v in &mut self.viewers {
+            // Say goodbye (RTCP BYE, DTLS close_notify), so the pages notice at once
+            // instead of after their own timeouts.
+            if v.rtc.close().is_ok() {
+                while v.rtc.is_alive() {
+                    match v.rtc.poll_output() {
+                        Ok(Output::Transmit(t)) => {
+                            let _ = self.socket.send_to(&t.contents, t.destination);
+                        }
+                        Ok(Output::Event(_)) => {}
+                        Ok(Output::Timeout(_)) | Err(_) => break,
+                    }
+                }
+            }
             v.rtc.disconnect();
         }
         self.viewers.clear();
