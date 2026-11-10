@@ -3,8 +3,9 @@
 //! The viewer page sets a ceiling; below it the rate follows the worst viewer's packet
 //! loss (RTCP receiver reports): back off while packets are being lost, by as much as
 //! is being lost, and climb back once the link has been clean for a while: briskly up
-//! to the neighbourhood of the rate that last lost packets, in small steps from there. Loss that NACK repairs cheaply
-//! (a percent or two on Wi-Fi) is not a reason to give up picture quality.
+//! to the neighbourhood of the rate that last lost packets, in small steps from there.
+//! Loss that NACK repairs cheaply (a percent or two on Wi-Fi) is not a reason to give
+//! up picture quality.
 
 use std::time::{Duration, Instant};
 

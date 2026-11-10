@@ -2,10 +2,12 @@
 //! (`Connection: close`), a thread per connection with a concurrency cap. The viewer
 //! page makes a handful of small requests; nothing more is needed.
 
+use crate::net::StopSignal;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const MAX_CONNECTIONS: usize = 32;
@@ -69,48 +71,44 @@ impl Response {
 
 pub type Handler = Arc<dyn Fn(Request) -> Response + Send + Sync>;
 
-/// Accept loop on its own thread. Setting `stop` and connecting once ends it.
-pub fn spawn(
-    listener: TcpListener,
-    handler: Handler,
-    stop: Arc<AtomicBool>,
-) -> std::io::Result<std::thread::JoinHandle<()>> {
+/// The accept loop; returns when `stop` is raised. `listener` must be non-blocking.
+pub fn accept_loop(listener: TcpListener, handler: Handler, stop: &StopSignal) {
     let active = Arc::new(AtomicUsize::new(0));
-    std::thread::Builder::new()
-        .name("fl-http".into())
-        .spawn(move || {
-            for conn in listener.incoming() {
-                if stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                let Ok(stream) = conn else {
-                    // Out of descriptors or similar: do not spin on a failing accept.
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                };
-                if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
-                    tracing::warn!("http: too many connections, dropping one");
-                    continue;
-                }
-                active.fetch_add(1, Ordering::SeqCst);
-                let (handler, active2) = (handler.clone(), active.clone());
-                let spawned = std::thread::Builder::new()
-                    .name("fl-http-conn".into())
-                    .spawn(move || {
-                        if let Err(e) = serve(stream, &handler) {
-                            tracing::debug!(error = %e, "http connection ended with an error");
-                        }
-                        active2.fetch_sub(1, Ordering::SeqCst);
-                    });
-                if spawned.is_err() {
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    tracing::warn!("http: could not spawn a connection thread");
-                }
+    while stop.wait_readable(listener.as_raw_fd()) {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => {
+                // Out of descriptors or similar: do not spin on a failing accept.
+                tracing::debug!(error = %e, "http: accept failed");
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
             }
-        })
+        };
+        if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+            tracing::warn!("http: too many connections, dropping one");
+            continue;
+        }
+        active.fetch_add(1, Ordering::SeqCst);
+        let (handler, active2) = (handler.clone(), active.clone());
+        let spawned = std::thread::Builder::new()
+            .name("fl-http-conn".into())
+            .spawn(move || {
+                if let Err(e) = serve(stream, &handler) {
+                    tracing::debug!(error = %e, "http connection ended with an error");
+                }
+                active2.fetch_sub(1, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            active.fetch_sub(1, Ordering::SeqCst);
+            tracing::warn!("http: could not spawn a connection thread");
+        }
+    }
 }
 
 fn serve(mut stream: TcpStream, handler: &Handler) -> std::io::Result<()> {
+    // The listener is non-blocking; a connection is served with blocking calls.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let _ = stream.set_nodelay(true);

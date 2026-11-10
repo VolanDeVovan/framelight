@@ -2,8 +2,8 @@
 //!
 //! A browser opens `http://<host>:<port>/`, the page posts an SDP offer and plays what
 //! comes back: H.264 video and Opus audio from one [`VideoSource`] / [`AudioSource`]
-//! pair, shared by every viewer. No pairing, no accounts, no input: whoever can reach
-//! the port can watch.
+//! pair, shared by every viewer. No accounts, no input: whoever can reach the port can
+//! watch.
 //!
 //! | endpoint                | what |
 //! |-------------------------|------|
@@ -14,33 +14,40 @@
 //! | `POST /bitrate?kbps=N`  | bitrate ceiling of the shared encode |
 //! | UDP, same port number   | ICE, DTLS, SRTP for all viewers |
 //!
-//! Threads (blocking, no async runtime): HTTP accept (+ one short-lived thread per
-//! request), UDP receive, the hub that owns every peer connection, and the video and
-//! audio pumps. With nobody watching all of them sleep in a blocking call and the
-//! sources are stopped.
+//! Threads (blocking, no async runtime), all owned by [`Server`]:
+//!
+//! | thread     | module | sleeps in |
+//! |------------|--------|-----------|
+//! | `fl-http`  | [`http`] accept loop (+ one short-lived thread per request) | `poll` |
+//! | `fl-udp`   | [`net`] datagrams in | `poll` |
+//! | `fl-hub`   | [`hub`] owns every peer connection | channel receive |
+//! | `fl-video` | [`pump`] runs the video source | a condition variable |
+//! | `fl-audio` | [`pump`] runs the audio source | a condition variable |
+//!
+//! With nobody watching all of them sleep without a timeout and the sources are
+//! stopped.
 
 mod adapt;
+mod api;
+mod clock;
 mod h264;
 mod http;
 mod hub;
+mod net;
+mod pump;
+mod viewer;
 
 pub use adapt::{FLOOR_KBPS, MAX_KBPS};
 
 use anyhow::{Context, Result};
 use fl_core::{AudioSource, H264Profile, StreamConfig, VideoSource};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-use str0m::change::SdpOffer;
-use str0m::{Candidate, RtcConfig};
 
 /// Free on the Steam Frame (Steam itself listens on 8080, 8081 and 8088).
 pub const DEFAULT_PORT: u16 = 8090;
-
-const PAGE: &str = include_str!("page.html");
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -94,52 +101,13 @@ pub struct Status {
     pub profile_level_id: Option<u32>,
 }
 
-impl Status {
-    fn json(&self) -> String {
-        let (state, error) = match &self.source {
-            SourceState::Idle => ("idle", ""),
-            SourceState::Starting => ("starting", ""),
-            SourceState::Running => ("running", ""),
-            SourceState::Failed(e) => ("failed", e.as_str()),
-        };
-        format!(
-            "{{\"viewers\":{},\"source\":\"{state}\",\"error\":\"{}\",\"bitrate_kbps\":{},\"ceiling_kbps\":{},\
-             \"min_kbps\":{FLOOR_KBPS},\"max_kbps\":{MAX_KBPS},\"width\":{},\"height\":{},\"fps\":{},\"profile_level_id\":\"{}\"}}",
-            self.viewers,
-            json_escape(error),
-            self.bitrate_kbps,
-            self.ceiling_kbps,
-            self.width,
-            self.height,
-            self.fps,
-            self.profile_level_id
-                .map(|p| format!("{p:06x}"))
-                .unwrap_or_default(),
-        )
-    }
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push(' '),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// A running streamer. Dropping it does not stop it; call [`Server::shutdown`].
+/// A running streamer. Dropping it disconnects every viewer, stops the sources and
+/// closes the ports.
 pub struct Server {
-    port: u16,
     status: Arc<Mutex<Status>>,
     tx: Sender<hub::Msg>,
-    stop: Arc<AtomicBool>,
-    /// Ends the UDP thread's sleep.
-    wake: std::os::fd::OwnedFd,
+    stop: Arc<net::StopSignal>,
+    ctl: Arc<pump::Control>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -157,8 +125,16 @@ impl Server {
             .with_context(|| format!("bind TCP port {}", cfg.port))?;
         let socket = UdpSocket::bind((any, cfg.port))
             .with_context(|| format!("bind UDP port {}", cfg.port))?;
-        hub::tune_socket(&socket);
+        // Nothing in here waits in a socket call: the threads sleep in poll().
+        listener
+            .set_nonblocking(true)
+            .context("make the TCP listener non-blocking")?;
+        socket
+            .set_nonblocking(true)
+            .context("make the UDP socket non-blocking")?;
+        net::tune_media_socket(&socket);
 
+        // Viewers decide the profile; this is only what an idle streamer reports.
         let stream = StreamConfig {
             width: cfg.width,
             height: cfg.height,
@@ -174,143 +150,82 @@ impl Server {
             fps: cfg.fps,
             ..Status::default()
         }));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (tx, mut threads, wake) =
-            hub::spawn(socket, stream, video, audio, status.clone(), stop.clone())?;
+        let (tx, rx) = channel();
+        let ctl = Arc::new(pump::Control::new(stream.profile, stream.bitrate_kbps));
+        let hub = hub::Hub::new(
+            socket.try_clone().context("clone the UDP socket")?,
+            rx,
+            ctl.clone(),
+            status.clone(),
+            cfg.bitrate_kbps,
+        );
+        let api = api::Api::new(&cfg.title, cfg.port, tx.clone(), status.clone());
+        let handler: http::Handler = Arc::new(move |req| api.route(&req));
 
-        let page: Arc<str> = PAGE.replace("{{TITLE}}", &html_escape(&cfg.title)).into();
-        let next_id = AtomicU64::new(1);
-        let (port, tx2, status2) = (cfg.port, tx.clone(), status.clone());
-        let handler: http::Handler =
-            Arc::new(move |req| route(&req, &page, port, &next_id, &tx2, &status2));
-        threads
-            .push(http::spawn(listener, handler, stop.clone()).context("spawn the HTTP thread")?);
+        // From here on a failure drops `server`, which stops what was already started.
+        let mut server = Server {
+            status,
+            tx: tx.clone(),
+            stop: Arc::new(net::StopSignal::new().context("eventfd")?),
+            ctl: ctl.clone(),
+            threads: Vec::new(),
+        };
+        server.spawn("fl-hub", move || hub.run())?;
+        {
+            let (stop, tx) = (server.stop.clone(), tx.clone());
+            server.spawn("fl-udp", move || net::udp_receiver(socket, stop, tx))?;
+        }
+        {
+            let (ctl, tx) = (ctl.clone(), tx.clone());
+            server.spawn("fl-video", move || pump::video(video, stream, &ctl, tx))?;
+        }
+        if let Some(audio) = audio {
+            server.spawn("fl-audio", move || pump::audio(audio, &ctl, tx))?;
+        }
+        {
+            let stop = server.stop.clone();
+            server.spawn("fl-http", move || {
+                http::accept_loop(listener, handler, &stop)
+            })?;
+        }
         tracing::info!(
             port = cfg.port,
             mode = %format!("{}x{}@{}", cfg.width, cfg.height, cfg.fps),
             bitrate_kbps = cfg.bitrate_kbps,
             "WebRTC streamer listening (page on TCP, media on UDP)"
         );
-        Ok(Server {
-            port: cfg.port,
-            status,
-            tx,
-            stop,
-            wake,
-            threads,
-        })
+        Ok(server)
+    }
+
+    fn spawn(&mut self, name: &str, f: impl FnOnce() + Send + 'static) -> Result<()> {
+        let thread = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(f)
+            .with_context(|| format!("spawn the {name} thread"))?;
+        self.threads.push(thread);
+        Ok(())
     }
 
     pub fn status(&self) -> Status {
         self.status.lock().unwrap().clone()
     }
 
-    /// Disconnect every viewer, stop the sources, close the ports.
-    pub fn shutdown(self) {
-        self.stop.store(true, Ordering::SeqCst);
+    /// Disconnect every viewer, stop the sources, close the ports. The same as
+    /// dropping the server; returns when every thread has ended.
+    pub fn shutdown(self) {}
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // The accept and receive threads, the pumps, and the hub, each by its own
+        // wake-up; none of them depends on another one still running.
+        self.stop.raise();
+        self.ctl.shutdown();
         let _ = self.tx.send(hub::Msg::Shutdown);
-        hub::wake(&self.wake);
-        // Wake the blocking accept.
-        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port);
-        let _ = TcpStream::connect_timeout(&local, Duration::from_millis(200));
-        for t in self.threads {
+        for t in self.threads.drain(..) {
             let _ = t.join();
         }
     }
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn route(
-    req: &http::Request,
-    page: &Arc<str>,
-    port: u16,
-    next_id: &AtomicU64,
-    tx: &Sender<hub::Msg>,
-    status: &Mutex<Status>,
-) -> http::Response {
-    use http::Response;
-    let status_json = || Response::json(status.lock().unwrap().json());
-    match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") | ("GET", "/index.html") => {
-            Response::new("text/html; charset=utf-8", page.as_bytes())
-        }
-        ("GET", "/status") => status_json(),
-        ("POST", "/offer") => {
-            let id = next_id.fetch_add(1, Ordering::SeqCst);
-            match accept_offer(req, port, id) {
-                Ok((viewer, answer)) => {
-                    if tx.send(hub::Msg::Join(Box::new(viewer))).is_err() {
-                        return Response::error(503, "the streamer is shutting down");
-                    }
-                    Response::new("application/sdp", answer).header("Viewer-Id", id.to_string())
-                }
-                Err(e) => {
-                    tracing::warn!(peer = %req.peer, error = %format!("{e:#}"), "offer rejected");
-                    Response::error(400, format!("{e:#}"))
-                }
-            }
-        }
-        ("POST", "/bye") => {
-            if let Some(id) = req.query_value("id").and_then(|v| v.parse().ok()) {
-                let _ = tx.send(hub::Msg::Leave(id));
-            }
-            Response::new("text/plain", "")
-        }
-        ("POST", "/bitrate") => match req.query_value("kbps").and_then(|v| v.parse::<u32>().ok()) {
-            Some(kbps) => {
-                let kbps = kbps.clamp(FLOOR_KBPS, MAX_KBPS);
-                let _ = tx.send(hub::Msg::Ceiling(kbps));
-                // The hub applies it a moment later; answer with what it will be.
-                let mut s = status.lock().unwrap().clone();
-                (s.ceiling_kbps, s.bitrate_kbps) = (kbps, kbps);
-                Response::json(s.json())
-            }
-            None => Response::error(400, "expected ?kbps=N"),
-        },
-        (_, "/" | "/index.html" | "/status" | "/offer" | "/bye" | "/bitrate") => {
-            Response::error(405, "method not allowed")
-        }
-        _ => Response::error(404, "not found"),
-    }
-}
-
-/// Builds the peer connection for one browser and answers its offer.
-fn accept_offer(req: &http::Request, port: u16, id: u64) -> Result<(hub::Viewer, String)> {
-    let sdp = std::str::from_utf8(&req.body).context("the offer is not UTF-8")?;
-    let offer =
-        SdpOffer::from_sdp_string(sdp).map_err(|e| anyhow::anyhow!("bad SDP offer: {e}"))?;
-    let profiles = h264::offered_profiles(sdp);
-    let max_profile = profiles
-        .iter()
-        .copied()
-        .max()
-        .context("this browser does not offer H.264 video over WebRTC")?;
-
-    let now = Instant::now();
-    let mut rtc = RtcConfig::new()
-        // The browser comes to us: we only answer connectivity checks.
-        .set_ice_lite(true)
-        .clear_codecs()
-        .enable_h264(true)
-        .enable_opus(true, false)
-        .set_stats_interval(Some(Duration::from_secs(1)))
-        .build(now);
-    // The one address this browser has already reached us on.
-    let local = SocketAddr::new(req.local.ip(), port);
-    rtc.add_local_candidate(Candidate::host(local, "udp").context("local candidate")?);
-    let answer = rtc
-        .sdp_api()
-        .accept_offer(offer)
-        .map_err(|e| anyhow::anyhow!("cannot answer the offer: {e}"))?;
-    Ok((
-        hub::Viewer::new(id, rtc, req.peer, local, max_profile, now),
-        answer.to_sdp_string(),
-    ))
 }
 
 /// The IPv4 address this machine uses towards the LAN (the source address of its
@@ -321,32 +236,5 @@ pub fn primary_ipv4() -> Option<Ipv4Addr> {
     match s.local_addr().ok()?.ip() {
         IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn status_json_is_valid_and_escaped() {
-        let s = Status {
-            viewers: 2,
-            source: SourceState::Failed("SteamVR \"is\" not\\running\n".into()),
-            bitrate_kbps: 9600,
-            ceiling_kbps: 12000,
-            width: 1920,
-            height: 1080,
-            fps: 60,
-            profile_level_id: Some(0x64002a),
-        };
-        let j = s.json();
-        assert!(j.contains("\"viewers\":2") && j.contains("\"source\":\"failed\""));
-        assert!(
-            j.contains(r#""error":"SteamVR \"is\" not\\running ""#),
-            "{j}"
-        );
-        assert!(j.contains("\"profile_level_id\":\"64002a\""));
-        assert_eq!(j.matches('{').count(), 1);
     }
 }
