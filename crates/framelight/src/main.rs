@@ -59,7 +59,9 @@ fn main() -> Result<()> {
         Some("vrtimings") => vrtimings(&args[1..]),
         Some("selftest") => selftest(&args[1..]),
         _ => {
-            eprintln!("usage: framelight app|serve|probe|vrtimings|selftest [options] (see source header)");
+            eprintln!(
+                "usage: framelight app|serve|probe|vrtimings|selftest [options] (see source header)"
+            );
             std::process::exit(2);
         }
     }
@@ -409,7 +411,14 @@ struct DmabufView {
 impl DmabufView {
     fn map(fd: std::os::fd::RawFd, len: usize) -> Result<Self> {
         let ptr = unsafe {
-            libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0)
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
         };
         if ptr == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error()).context("mmap dmabuf");
@@ -561,7 +570,9 @@ fn selftest(a: &[String]) -> Result<()> {
             dmabuf_sync(fd, DMA_BUF_SYNC_START)?;
         }
         // Read through a mapping of the dmabuf itself, which the sync bracket covers.
-        let view = dmabuf.map(|fd| DmabufView::map(fd, l.size as usize)).transpose()?;
+        let view = dmabuf
+            .map(|fd| DmabufView::map(fd, l.size as usize))
+            .transpose()?;
         let (bad, max) = compare_nv12(
             match &view {
                 Some(v) => v.bytes(),
@@ -586,7 +597,10 @@ fn selftest(a: &[String]) -> Result<()> {
                 l.stride,
                 l.uv_offset,
             );
-            info!("frame {n}: buffer {idx} first {bad}/{max}, after 30 ms {}/{}", again.0, again.1);
+            info!(
+                "frame {n}: buffer {idx} first {bad}/{max}, after 30 ms {}/{}",
+                again.0, again.1
+            );
         }
         drop(view);
         if let Some(fd) = dmabuf {
@@ -733,9 +747,14 @@ impl Streamer {
     }
 
     fn start(&self) -> Result<fl_webrtc::Server> {
-        let audio: Option<Box<dyn fl_core::AudioSource>> =
-            self.audio.then(|| Box::new(fl_audio::MonitorAudioSource::new()) as _);
-        fl_webrtc::Server::start(self.cfg.clone(), Box::new(HeadsetSource::new(self.opts.clone())), audio)
+        let audio: Option<Box<dyn fl_core::AudioSource>> = self
+            .audio
+            .then(|| Box::new(fl_audio::MonitorAudioSource::new()) as _);
+        fl_webrtc::Server::start(
+            self.cfg.clone(),
+            Box::new(HeadsetSource::new(self.opts.clone())),
+            audio,
+        )
     }
 
     /// The addresses to type into a browser: by name (avahi announces `<hostname>.local`)

@@ -137,7 +137,8 @@ impl Drop for Session {
 /// unloading a C++ library that has started threads is asking for a crash (each of
 /// which SteamOS reports to Valve as a minidump).
 fn library() -> Result<&'static Library> {
-    static LIB: std::sync::OnceLock<std::result::Result<Library, String>> = std::sync::OnceLock::new();
+    static LIB: std::sync::OnceLock<std::result::Result<Library, String>> =
+        std::sync::OnceLock::new();
     // SAFETY: loading Valve's client library; its initialisers are benign.
     LIB.get_or_init(|| unsafe { Library::new(LIB_PATH) }.map_err(|e| e.to_string()))
         .as_ref()

@@ -18,12 +18,20 @@ impl Encoder {
         let mut err = 0;
         // SAFETY: plain constructor; `err` outlives the call.
         let st = unsafe {
-            sys::opus_encoder_create(rate as i32, channels as i32, sys::OPUS_APPLICATION_RESTRICTED_LOWDELAY, &mut err)
+            sys::opus_encoder_create(
+                rate as i32,
+                channels as i32,
+                sys::OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+                &mut err,
+            )
         };
         if st.is_null() || err != sys::OPUS_OK {
             bail!("opus_encoder_create failed ({err})");
         }
-        let enc = Self { st, channels: channels as usize };
+        let enc = Self {
+            st,
+            channels: channels as usize,
+        };
         enc.ctl(sys::OPUS_SET_BITRATE_REQUEST, bitrate as i32)?;
         enc.ctl(sys::OPUS_SET_VBR_REQUEST, 0)?;
         enc.ctl(sys::OPUS_SET_COMPLEXITY_REQUEST, complexity as i32)?;
@@ -43,7 +51,15 @@ impl Encoder {
     pub fn encode(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize> {
         let frame = (pcm.len() / self.channels) as i32;
         // SAFETY: `pcm` holds `frame * channels` samples and `out` is writable for its length.
-        let n = unsafe { sys::opus_encode(self.st, pcm.as_ptr(), frame, out.as_mut_ptr(), out.len() as i32) };
+        let n = unsafe {
+            sys::opus_encode(
+                self.st,
+                pcm.as_ptr(),
+                frame,
+                out.as_mut_ptr(),
+                out.len() as i32,
+            )
+        };
         if n < 0 {
             bail!("opus_encode failed ({n})");
         }
@@ -71,14 +87,18 @@ mod tests {
             let mut out = [0u8; 1500];
             let mut lens = Vec::new();
             for i in 0..50 {
-                let pcm: Vec<i16> =
-                    (0..frame).map(|n| ((((i * frame + n) / 2) as f32 * 0.115).sin() * 3000.0) as i16).collect();
+                let pcm: Vec<i16> = (0..frame)
+                    .map(|n| ((((i * frame + n) / 2) as f32 * 0.115).sin() * 3000.0) as i16)
+                    .collect();
                 let n = enc.encode(&pcm, &mut out).unwrap();
                 assert_eq!(out[0] >> 3, config, "{ms} ms");
                 assert_eq!(out[0] & 0x04, 0x04, "stereo");
                 lens.push(n);
             }
-            assert!(lens.iter().all(|&n| n == (96_000 / 8 * ms / 1000) as usize), "{ms} ms: {lens:?}");
+            assert!(
+                lens.iter().all(|&n| n == (96_000 / 8 * ms / 1000) as usize),
+                "{ms} ms: {lens:?}"
+            );
         }
     }
 }

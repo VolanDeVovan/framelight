@@ -66,7 +66,8 @@ pub struct Pulse {
     context_disconnect: unsafe extern "C" fn(P),
     context_unref: unsafe extern "C" fn(P),
     stream_new: unsafe extern "C" fn(P, *const c_char, *const SampleSpec, *const c_void) -> P,
-    stream_connect_record: unsafe extern "C" fn(P, *const c_char, *const BufferAttr, c_int) -> c_int,
+    stream_connect_record:
+        unsafe extern "C" fn(P, *const c_char, *const BufferAttr, c_int) -> c_int,
     stream_get_state: unsafe extern "C" fn(P) -> c_int,
     stream_peek: unsafe extern "C" fn(P, *mut *const c_void, *mut usize) -> c_int,
     stream_drop: unsafe extern "C" fn(P) -> c_int,
@@ -82,7 +83,8 @@ impl Pulse {
         macro_rules! sym {
             ($name:literal) => {
                 // SAFETY: the field types match the libpulse prototypes of these symbols.
-                *unsafe { lib.get(concat!($name, "\0").as_bytes()) }.with_context(|| format!("dlsym {}", $name))?
+                *unsafe { lib.get(concat!($name, "\0").as_bytes()) }
+                    .with_context(|| format!("dlsym {}", $name))?
             };
         }
         Ok(Self {
@@ -112,7 +114,9 @@ impl Pulse {
 
     fn error(&self, ctx: P) -> String {
         // SAFETY: ctx is a live context; pa_strerror returns a static string.
-        unsafe { CStr::from_ptr((self.strerror)((self.context_errno)(ctx))) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr((self.strerror)((self.context_errno)(ctx))) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -135,7 +139,9 @@ pub struct Shared {
 impl Shared {
     pub fn new(cap: usize, notify_at: usize) -> Self {
         Self {
-            ring: Mutex::new(Ring { buf: VecDeque::with_capacity(cap + notify_at) }),
+            ring: Mutex::new(Ring {
+                buf: VecDeque::with_capacity(cap + notify_at),
+            }),
             cond: Condvar::new(),
             stop: AtomicBool::new(false),
             cap,
@@ -146,7 +152,9 @@ impl Shared {
     fn push(&self, bytes: Option<&[u8]>, len: usize) {
         let mut r = self.ring.lock().unwrap();
         match bytes {
-            Some(b) => r.buf.extend(b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]))),
+            Some(b) => r
+                .buf
+                .extend(b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]))),
             // A hole in the stream: fill with silence.
             None => r.buf.extend(std::iter::repeat_n(0, len / 2)),
         }
@@ -211,7 +219,12 @@ impl Drop for Conn<'_> {
 }
 
 fn capture(pa: &Pulse, shared: &Shared, rate: u32, channels: u8, frag_bytes: u32) -> Result<()> {
-    let mut c = Conn { pa, ml: ptr::null_mut(), ctx: ptr::null_mut(), stream: ptr::null_mut() };
+    let mut c = Conn {
+        pa,
+        ml: ptr::null_mut(),
+        ctx: ptr::null_mut(),
+        stream: ptr::null_mut(),
+    };
     // SAFETY: straightforward libpulse object lifecycle on one thread; `Conn` frees.
     unsafe {
         c.ml = (pa.mainloop_new)();
@@ -234,11 +247,17 @@ fn capture(pa: &Pulse, shared: &Shared, rate: u32, channels: u8, frag_bytes: u32
             }
             match (pa.context_get_state)(c.ctx) {
                 PA_CONTEXT_READY => {}
-                PA_CONTEXT_FAILED | PA_CONTEXT_TERMINATED => bail!("sound server connection: {}", pa.error(c.ctx)),
+                PA_CONTEXT_FAILED | PA_CONTEXT_TERMINATED => {
+                    bail!("sound server connection: {}", pa.error(c.ctx))
+                }
                 _ => continue,
             }
             if c.stream.is_null() {
-                let ss = SampleSpec { format: PA_SAMPLE_S16LE, rate, channels };
+                let ss = SampleSpec {
+                    format: PA_SAMPLE_S16LE,
+                    rate,
+                    channels,
+                };
                 c.stream = (pa.stream_new)(c.ctx, c"framelight monitor".as_ptr(), &ss, ptr::null());
                 anyhow::ensure!(!c.stream.is_null(), "pa_stream_new: {}", pa.error(c.ctx));
                 // Small fragments (one packet). The thread drains every fragment as it
@@ -251,7 +270,13 @@ fn capture(pa: &Pulse, shared: &Shared, rate: u32, channels: u8, frag_bytes: u32
                     minreq: u32::MAX,
                     fragsize: frag_bytes,
                 };
-                if (pa.stream_connect_record)(c.stream, DEVICE.as_ptr(), &attr, PA_STREAM_ADJUST_LATENCY) < 0 {
+                if (pa.stream_connect_record)(
+                    c.stream,
+                    DEVICE.as_ptr(),
+                    &attr,
+                    PA_STREAM_ADJUST_LATENCY,
+                ) < 0
+                {
                     bail!("record {}: {}", DEVICE.to_string_lossy(), pa.error(c.ctx));
                 }
                 continue;
@@ -259,7 +284,11 @@ fn capture(pa: &Pulse, shared: &Shared, rate: u32, channels: u8, frag_bytes: u32
             match (pa.stream_get_state)(c.stream) {
                 PA_STREAM_READY => {}
                 PA_STREAM_FAILED | PA_STREAM_TERMINATED => {
-                    bail!("record stream on {}: {}", DEVICE.to_string_lossy(), pa.error(c.ctx))
+                    bail!(
+                        "record stream on {}: {}",
+                        DEVICE.to_string_lossy(),
+                        pa.error(c.ctx)
+                    )
                 }
                 _ => continue,
             }
@@ -276,7 +305,8 @@ fn capture(pa: &Pulse, shared: &Shared, rate: u32, channels: u8, frag_bytes: u32
                 if n == 0 {
                     break;
                 }
-                let bytes = (!data.is_null()).then(|| std::slice::from_raw_parts(data as *const u8, n));
+                let bytes =
+                    (!data.is_null()).then(|| std::slice::from_raw_parts(data as *const u8, n));
                 shared.push(bytes, n);
                 (pa.stream_drop)(c.stream);
             }

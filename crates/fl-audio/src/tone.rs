@@ -58,7 +58,10 @@ impl AudioSource for ToneAudioSource {
         let n = r.enc.encode(&r.pcm, &mut r.out)?;
         let pts_us = r.emitted * packet.as_micros() as u64;
         r.emitted += 1;
-        Ok(AudioPacket { data: Bytes::copy_from_slice(&r.out[..n]), pts_us })
+        Ok(AudioPacket {
+            data: Bytes::copy_from_slice(&r.out[..n]),
+            pts_us,
+        })
     }
 
     fn stop(&mut self) {

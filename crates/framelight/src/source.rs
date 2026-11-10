@@ -47,7 +47,6 @@ pub struct SourceOptions {
     pub coded_format: Option<u32>,
 }
 
-
 /// Per-frame numbers for the probe.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStats {

@@ -268,7 +268,9 @@ impl HeadsetCapture {
             }
             // Lets the release barrier hand the buffer to the encoder (a foreign
             // agent), which is what makes the driver flush its caches for it.
-            let foreign = ash::ext::queue_family_foreign::NAME.to_string_lossy().into_owned();
+            let foreign = ash::ext::queue_family_foreign::NAME
+                .to_string_lossy()
+                .into_owned();
             if dev_available.contains(&foreign) {
                 dexts.push(foreign);
             }
@@ -362,7 +364,10 @@ impl HeadsetCapture {
                     .command_buffer_count(1),
             )
         }?[0];
-        cap.fence = unsafe { cap.device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
+        cap.fence = unsafe {
+            cap.device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }?;
         cap.provider.attach(&VkHandles {
             instance: &cap.instance,
             device: &cap.device,
@@ -565,7 +570,9 @@ impl HeadsetCapture {
                 // Take the buffer back from the encoder before overwriting it.
                 let acquire = vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE,
+                    )
                     .src_queue_family_index(self.foreign_family)
                     .dst_queue_family_index(self.qfi)
                     .buffer(dst_buffer)
@@ -891,7 +898,13 @@ impl HeadsetCapture {
         let bands: Vec<_> = BARS
             .iter()
             .enumerate()
-            .map(|(k, c)| (h * k as u32 / 8, h * (k as u32 + 1) / 8, rgb_to_ycbcr709(*c)))
+            .map(|(k, c)| {
+                (
+                    h * k as u32 / 8,
+                    h * (k as u32 + 1) / 8,
+                    rgb_to_ycbcr709(*c),
+                )
+            })
             .collect();
         self.record_fill_nv12(dst_buffer, &bands);
     }

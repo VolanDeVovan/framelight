@@ -68,7 +68,12 @@ impl Default for MonitorAudioSource {
 
 impl MonitorAudioSource {
     pub fn new() -> Self {
-        Self { bitrate: 96_000, complexity: 5, pulse: None, run: None }
+        Self {
+            bitrate: 96_000,
+            complexity: 5,
+            pulse: None,
+            run: None,
+        }
     }
 }
 
@@ -101,7 +106,11 @@ impl AudioSource for MonitorAudioSource {
             }
             None => None,
         };
-        tracing::info!(packet_ms = PACKET_MS, bitrate = self.bitrate, "audio: monitor source started");
+        tracing::info!(
+            packet_ms = PACKET_MS,
+            bitrate = self.bitrate,
+            "audio: monitor source started"
+        );
         self.run = Some(Running {
             shared,
             thread,
@@ -164,7 +173,10 @@ impl AudioSource for MonitorAudioSource {
         let n = r.enc.encode(&r.pcm, &mut r.out)?;
         let pts_us = r.emitted * r.packet.as_micros() as u64;
         r.emitted += 1;
-        Ok(AudioPacket { data: Bytes::copy_from_slice(&r.out[..n]), pts_us })
+        Ok(AudioPacket {
+            data: Bytes::copy_from_slice(&r.out[..n]),
+            pts_us,
+        })
     }
 
     fn stop(&mut self) {

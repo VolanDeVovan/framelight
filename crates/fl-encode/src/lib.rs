@@ -118,7 +118,10 @@ fn h264_level_menu(width: u32, height: u32, fps: u32) -> i32 {
         (15, 983_040, 36_864),
         (16, 2_073_600, 36_864),
     ];
-    LEVELS.iter().find(|&&(_, mbps, fs)| rate <= mbps && mbs <= fs).map_or(16, |l| l.0)
+    LEVELS
+        .iter()
+        .find(|&&(_, mbps, fs)| rate <= mbps && mbs <= fs)
+        .map_or(16, |l| l.0)
 }
 
 struct Mapping {
@@ -476,7 +479,12 @@ impl Encoder {
         let f = self.fd.as_raw_fd();
         let bps = (kbps as i64 * 1000).clamp(1, i32::MAX as i64) as i32;
         let ok = set_ctrl(f, CID_MPEG_VIDEO_BITRATE, bps, "bitrate")
-            & set_ctrl(f, CID_MPEG_VIDEO_BITRATE_PEAK, bps.saturating_add(bps / 2), "peak_bitrate");
+            & set_ctrl(
+                f,
+                CID_MPEG_VIDEO_BITRATE_PEAK,
+                bps.saturating_add(bps / 2),
+                "peak_bitrate",
+            );
         if !ok {
             bail!("the encoder refused a bitrate change to {kbps} kbit/s");
         }
