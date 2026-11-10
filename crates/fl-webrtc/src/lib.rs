@@ -27,7 +27,7 @@ mod hub;
 pub use adapt::{FLOOR_KBPS, MAX_KBPS};
 
 use anyhow::{Context, Result};
-use fl_core::{AudioSource, Codec, H264Profile, StreamConfig, VideoSource};
+use fl_core::{AudioSource, H264Profile, StreamConfig, VideoSource};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -164,7 +164,6 @@ impl Server {
             height: cfg.height,
             fps: cfg.fps,
             bitrate_kbps: cfg.bitrate_kbps,
-            codec: Codec::H264,
             profile: H264Profile::High,
         };
         let status = Arc::new(Mutex::new(Status {

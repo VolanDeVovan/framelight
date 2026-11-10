@@ -3,10 +3,11 @@ name = "fl-capture"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "SteamVR Headset View -> NV12 in an encoder buffer (Vulkan compute)"
 
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true
-libc = "0.2"
+fl-core.workspace = true
 libloading = "0.8"
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }

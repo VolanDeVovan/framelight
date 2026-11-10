@@ -3,12 +3,9 @@
 //! The view is read with `IVROverlayView::AcquireOverlayView` on the
 //! `system.HeadsetView` overlay (works while the overlay is hidden). One
 //! compute dispatch (shaders/nv12.comp) samples it, scales it to the output
-//! size (aspect kept, black bars) and writes BT.709 limited-range NV12 into
-//! the encoder's input buffer. In the default mode those input buffers are
-//! the encoder's own MMAP buffers exported as dmabufs and imported into
-//! Vulkan as linear storage buffers, so the CPU never touches a pixel. The
-//! fallback mode writes a host-visible staging buffer and does one memcpy
-//! into the encoder's mmap.
+//! size (aspect kept, black bars) and writes BT.709 limited-range NV12 into a
+//! host-visible buffer; one memcpy then moves the frame into the encoder's
+//! input buffer.
 //!
 //! The compositor's image is only sampled, never transitioned: it stays in
 //! SHADER_READ_ONLY_OPTIMAL. (A first version blitted it after moving it to
@@ -19,62 +16,33 @@ pub mod openvr;
 pub mod provider;
 
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ash::vk::{self, Handle};
+use fl_core::Nv12Layout;
 pub use provider::{SyntheticProvider, ViewImage, ViewProvider, VkHandles};
 use tracing::{debug, info, warn};
 
 pub const HEADSET_VIEW: &str = "system.HeadsetView";
 
-/// How a frame reaches the encoder input buffers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TargetMode {
-    /// GPU writes straight into dmabufs exported by the encoder.
-    DmaBuf,
-    /// GPU writes into host memory, CPU copies into the encoder's mmap.
-    Mmap,
-}
-
-/// Layout of the encoder's single-plane NV12 input buffers.
-#[derive(Clone, Copy, Debug)]
-pub struct TargetLayout {
-    pub width: u32,
-    pub height: u32,
-    /// Bytes per row of both planes.
-    pub stride: u32,
-    /// Luma rows in the buffer (the height, padded by the encoder).
-    pub rows: u32,
-    /// Byte offset of the chroma plane.
-    pub uv_offset: u32,
-}
-
-impl TargetLayout {
-    /// Bytes of the target buffer that may get written.
-    pub fn bytes(&self) -> u64 {
-        self.uv_offset as u64 + self.stride as u64 * (self.rows as u64).div_ceil(2)
+/// The shader writes whole 32-bit words: four luma bytes (or two CbCr pairs) per
+/// invocation, so a row may be written up to the next multiple of four past the
+/// picture width; the stride must cover that.
+fn check_layout(l: &Nv12Layout) -> Result<()> {
+    let ok = l.width > 0
+        && l.height > 0
+        && l.width.is_multiple_of(2)
+        && l.height.is_multiple_of(2)
+        && l.stride.is_multiple_of(4)
+        && l.stride >= l.width.next_multiple_of(4)
+        && l.rows >= l.height
+        && l.uv_offset.is_multiple_of(4)
+        && l.uv_offset as u64 >= l.stride as u64 * l.height as u64;
+    if !ok {
+        bail!("unusable encoder input layout {l:?}");
     }
-
-    /// The shader writes whole 32-bit words: four luma bytes (or two CbCr pairs) per
-    /// invocation, so a row may be written up to the next multiple of four past the
-    /// picture width; the stride must cover that.
-    fn check(&self) -> Result<()> {
-        let ok = self.width > 0
-            && self.height > 0
-            && self.width.is_multiple_of(2)
-            && self.height.is_multiple_of(2)
-            && self.stride.is_multiple_of(4)
-            && self.stride >= self.width.next_multiple_of(4)
-            && self.rows >= self.height
-            && self.uv_offset.is_multiple_of(4)
-            && self.uv_offset as u64 >= self.stride as u64 * self.height as u64;
-        if !ok {
-            bail!("unusable target layout {self:?}");
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Push constants of shaders/nv12.comp.
@@ -88,6 +56,7 @@ struct Nv12Params {
     stride: u32,
     uv_offset: u32,
     srgb_source: i32,
+    /// Always 1: a missing view is filled black without the shader.
     has_source: i32,
 }
 
@@ -104,21 +73,15 @@ static NV12_SPV: &[u8] = include_bytes!("../shaders/nv12.spv");
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CaptureInfo {
-    /// False when SteamVR had no image yet (a black frame was written).
+    /// False when SteamVR had no image (a black frame was written).
     pub had_image: bool,
-    /// Submit to fence signalled (GPU blit + copy, plus scheduling).
+    /// Submit to fence signalled (the compute pass, plus scheduling).
     pub gpu_time: Duration,
-    /// CPU memcpy time (Mmap mode only).
+    /// The memcpy into the encoder's buffer.
     pub copy_time: Duration,
-    pub source_width: u32,
-    pub source_height: u32,
 }
 
-struct Target {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-}
-
+/// The host-visible buffer the compute pass writes.
 struct Staging {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -135,24 +98,18 @@ pub struct HeadsetCapture {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     mem_props: vk::PhysicalDeviceMemoryProperties,
-    /// Queue family of `queue`, and the family the encoder buffers are released to.
-    qfi: u32,
-    foreign_family: u32,
-    layout: TargetLayout,
-    mode: TargetMode,
-    targets: Vec<Target>,
+    layout: Nv12Layout,
     staging: Option<Staging>,
     compute: Option<Compute>,
-    /// Views of the compositor's images (it cycles through a few), by image handle
-    /// and format.
-    src_views: std::collections::HashMap<(u64, i32), vk::ImageView>,
-    last_source: (u32, u32, u32),
-    /// Write colour bars instead of the view (pipeline and colour check).
-    pub test_pattern: bool,
+    /// Views of the compositor's images (it cycles through a few), by image handle,
+    /// format and size.
+    src_views: std::collections::HashMap<(u64, i32, u32, u32), vk::ImageView>,
+    /// (width, height, format) of the view last logged.
+    last_source: (u32, u32, i32),
     provider: Box<dyn ViewProvider>,
 }
 
-// Vulkan handles and OpenVR tables are used from one thread at a time.
+// SAFETY: Vulkan handles and OpenVR tables are used from one thread at a time.
 unsafe impl Send for HeadsetCapture {}
 
 /// Destroys the instance unless construction got far enough to hand it over.
@@ -175,15 +132,10 @@ fn is_unorm8(f: vk::Format) -> bool {
 }
 
 impl HeadsetCapture {
-    /// `dmabufs`: the encoder's input buffers (DmaBuf mode) or `None` for the
-    /// Mmap fallback. Fails if the dmabuf import fails; the caller decides
-    /// whether to fall back.
-    pub fn new(
-        layout: TargetLayout,
-        dmabufs: Option<&[BorrowedFd<'_>]>,
-        provider: Box<dyn ViewProvider>,
-    ) -> Result<Self> {
-        layout.check()?;
+    /// `layout`: the encoder's input buffers, which every [`HeadsetCapture::capture`]
+    /// fills. `provider`: where the picture comes from.
+    pub fn new(layout: Nv12Layout, provider: Box<dyn ViewProvider>) -> Result<Self> {
+        check_layout(&layout)?;
         // SAFETY: loads libvulkan.so.1 at run time.
         let entry = unsafe { ash::Entry::load() }.context("loading libvulkan.so.1")?;
         let mut iexts: Vec<CString> = provider
@@ -255,26 +207,6 @@ impl HeadsetCapture {
                 .collect();
         let mut dexts: Vec<String> = provider.device_extensions(pd);
         debug!("view provider wants device extensions {dexts:?}");
-        if dmabufs.is_some() {
-            for e in [
-                ash::khr::external_memory_fd::NAME,
-                ash::ext::external_memory_dma_buf::NAME,
-            ] {
-                let e = e.to_string_lossy().into_owned();
-                if !dev_available.contains(&e) {
-                    bail!("Vulkan device lacks {e}: dmabuf import impossible");
-                }
-                dexts.push(e);
-            }
-            // Lets the release barrier hand the buffer to the encoder (a foreign
-            // agent), which is what makes the driver flush its caches for it.
-            let foreign = ash::ext::queue_family_foreign::NAME
-                .to_string_lossy()
-                .into_owned();
-            if dev_available.contains(&foreign) {
-                dexts.push(foreign);
-            }
-        }
         dexts.sort();
         dexts.dedup();
         dexts.retain(|e| {
@@ -289,15 +221,6 @@ impl HeadsetCapture {
             .filter_map(|s| CString::new(s).ok())
             .collect();
         let dext_ptrs: Vec<_> = dexts.iter().map(|e| e.as_ptr()).collect();
-        let foreign_family = if dexts
-            .iter()
-            .any(|e| e.as_c_str() == ash::ext::queue_family_foreign::NAME)
-        {
-            vk::QUEUE_FAMILY_FOREIGN_EXT
-        } else {
-            vk::QUEUE_FAMILY_EXTERNAL
-        };
-
         let qfs = unsafe { instance.get_physical_device_queue_family_properties(pd) };
         let qfi = qfs
             .iter()
@@ -332,20 +255,11 @@ impl HeadsetCapture {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             mem_props,
-            qfi,
-            foreign_family,
             layout,
-            mode: if dmabufs.is_some() {
-                TargetMode::DmaBuf
-            } else {
-                TargetMode::Mmap
-            },
-            targets: Vec::new(),
             staging: None,
             compute: None,
             src_views: Default::default(),
             last_source: (0, 0, 0),
-            test_pattern: false,
             provider,
         };
         cap.pool = unsafe {
@@ -375,35 +289,9 @@ impl HeadsetCapture {
             queue,
             queue_family_index: qfi,
         })?;
-        match dmabufs {
-            Some(fds) => {
-                let fd_ext = ash::khr::external_memory_fd::Device::new(&cap.instance, &cap.device);
-                for (i, fd) in fds.iter().enumerate() {
-                    let t = cap
-                        .import_dmabuf(&fd_ext, *fd)
-                        .with_context(|| format!("importing encoder buffer {i}"))?;
-                    cap.targets.push(t);
-                }
-                info!(
-                    "capture: {} encoder buffers imported as dmabuf (zero-copy)",
-                    cap.targets.len()
-                );
-            }
-            None => {
-                cap.staging = Some(cap.create_staging()?);
-                info!("capture: mmap fallback (one CPU copy per frame)");
-            }
-        }
+        cap.staging = Some(cap.create_staging()?);
         cap.compute = Some(cap.create_compute()?);
         Ok(cap)
-    }
-
-    pub fn mode(&self) -> TargetMode {
-        self.mode
-    }
-
-    pub fn provider(&self) -> &dyn ViewProvider {
-        &*self.provider
     }
 
     pub fn provider_mut(&mut self) -> &mut dyn ViewProvider {
@@ -419,82 +307,8 @@ impl HeadsetCapture {
         })
     }
 
-    fn import_dmabuf(
-        &self,
-        fd_ext: &ash::khr::external_memory_fd::Device,
-        fd: BorrowedFd<'_>,
-    ) -> Result<Target> {
-        let size = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) };
-        if size <= 0 {
-            bail!("dmabuf has no size");
-        }
-        let needed = self.layout.bytes();
-        if (size as u64) < needed {
-            bail!("dmabuf is {size} bytes, need {needed}");
-        }
-        let dmabuf = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
-        unsafe {
-            let mut ext = vk::ExternalMemoryBufferCreateInfo::default().handle_types(dmabuf);
-            let buffer = self.device.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(size as u64)
-                    .usage(
-                        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
-                    )
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .push_next(&mut ext),
-                None,
-            )?;
-            let reqs = self.device.get_buffer_memory_requirements(buffer);
-            let mut fdp = vk::MemoryFdPropertiesKHR::default();
-            fd_ext
-                .get_memory_fd_properties(dmabuf, fd.as_raw_fd(), &mut fdp)
-                .context("vkGetMemoryFdPropertiesKHR")?;
-            let bits = reqs.memory_type_bits & fdp.memory_type_bits;
-            if bits == 0 {
-                self.device.destroy_buffer(buffer, None);
-                bail!(
-                    "no memory type fits (buffer {:#x}, dmabuf {:#x})",
-                    reqs.memory_type_bits,
-                    fdp.memory_type_bits
-                );
-            }
-            // Vulkan owns the fd once the import succeeds, so hand it a dup.
-            let dup: OwnedFd = fd.try_clone_to_owned()?;
-            let raw = dup.into_raw_fd();
-            let mut import = vk::ImportMemoryFdInfoKHR::default()
-                .handle_type(dmabuf)
-                .fd(raw);
-            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
-            let info = vk::MemoryAllocateInfo::default()
-                .allocation_size(reqs.size.max(size as u64))
-                .memory_type_index(bits.trailing_zeros())
-                .push_next(&mut import)
-                .push_next(&mut dedicated);
-            let memory = match self.device.allocate_memory(&info, None) {
-                Ok(m) => m,
-                Err(e) => {
-                    libc::close(raw);
-                    self.device.destroy_buffer(buffer, None);
-                    return Err(e).context("vkAllocateMemory (dmabuf import)");
-                }
-            };
-            if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
-                self.device.destroy_buffer(buffer, None);
-                self.device.free_memory(memory, None);
-                return Err(e).context("vkBindBufferMemory (dmabuf import)");
-            }
-            debug!(
-                "imported dmabuf of {size} bytes, memory type {} ({:?})",
-                bits.trailing_zeros(),
-                self.mem_props.memory_types[bits.trailing_zeros() as usize].property_flags
-            );
-            Ok(Target { buffer, memory })
-        }
-    }
-
     fn create_staging(&self) -> Result<Staging> {
-        let size = self.layout.bytes();
+        let size = self.layout.bytes() as u64;
         unsafe {
             let buffer = self.device.create_buffer(
                 &vk::BufferCreateInfo::default().size(size).usage(
@@ -532,17 +346,14 @@ impl HeadsetCapture {
         }
     }
 
-    /// Captures the current Headset View into target buffer `index`
-    /// (DmaBuf mode), or into `dst` (Mmap mode: the encoder's mapping).
-    pub fn capture(&mut self, index: usize, dst: Option<&mut [u8]>) -> Result<CaptureInfo> {
+    /// Converts the current view into `dst`, an encoder input buffer of the layout
+    /// given to [`HeadsetCapture::new`]. Without a view (headset in standby) the frame
+    /// is black.
+    pub fn capture(&mut self, dst: &mut [u8]) -> Result<CaptureInfo> {
         let mut info = CaptureInfo::default();
-        let src = if self.test_pattern {
-            None
-        } else {
-            self.provider.acquire()?
-        };
+        let src = self.provider.acquire()?;
         if let Some(t) = src {
-            let key = (t.width, t.height, t.format.as_raw() as u32);
+            let key = (t.width, t.height, t.format.as_raw());
             if key != self.last_source {
                 info!(
                     "headset view: {}x{} format {:?} samples {}",
@@ -551,13 +362,19 @@ impl HeadsetCapture {
                 self.last_source = key;
             }
             info.had_image = true;
-            info.source_width = t.width;
-            info.source_height = t.height;
         }
-        let dst_buffer = match self.mode {
-            TargetMode::DmaBuf => self.targets.get(index).context("bad target index")?.buffer,
-            TargetMode::Mmap => self.staging.as_ref().unwrap().buffer,
+        let (buffer, memory, ptr, size) = {
+            let st = self.staging.as_ref().context("capture not initialised")?;
+            (st.buffer, st.memory, st.ptr, st.size)
         };
+        if dst.len() < size {
+            bail!(
+                "encoder buffer of {} bytes, the frame needs {size}",
+                dst.len()
+            );
+        }
+        // SAFETY: every handle belongs to `self.device` and is used from this thread
+        // only; the command buffer is not pending (the previous submit was waited for).
         unsafe {
             self.device
                 .reset_command_buffer(self.cb, vk::CommandBufferResetFlags::empty())?;
@@ -566,49 +383,20 @@ impl HeadsetCapture {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-            if self.mode == TargetMode::DmaBuf {
-                // Take the buffer back from the encoder before overwriting it.
-                let acquire = vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(
-                        vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE,
-                    )
-                    .src_queue_family_index(self.foreign_family)
-                    .dst_queue_family_index(self.qfi)
-                    .buffer(dst_buffer)
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE);
-                self.device.cmd_pipeline_barrier(
-                    self.cb,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[acquire],
-                    &[],
-                );
-            }
         }
-        let stage = if self.test_pattern {
-            self.record_test_pattern(dst_buffer);
-            vk::PipelineStageFlags::TRANSFER
-        } else {
-            self.record_nv12(dst_buffer, src)?
+        let stage = match src {
+            Some(t) => self.record_nv12(buffer, &t)?,
+            None => self.record_black(buffer),
         };
         let d = &self.device;
-        // An encoder buffer is released to the encoder after every write; a plain
-        // barrier left GPU cache lines unflushed when it read the frame.
-        let (src_family, dst_family) = match self.mode {
-            TargetMode::DmaBuf => (self.qfi, self.foreign_family),
-            TargetMode::Mmap => (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED),
-        };
+        // SAFETY: as above; `ptr` maps `size` bytes of `memory` for the device's life.
         unsafe {
             let done = vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ)
-                .src_queue_family_index(src_family)
-                .dst_queue_family_index(dst_family)
-                .buffer(dst_buffer)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE);
             d.cmd_pipeline_barrier(
@@ -631,24 +419,17 @@ impl HeadsetCapture {
             )
             .context("vkQueueSubmit")?;
             d.wait_for_fences(&[self.fence], true, 1_000_000_000)
-                .context("waiting for the capture copy")?;
+                .context("waiting for the GPU conversion")?;
             d.reset_fences(&[self.fence])?;
             info.gpu_time = t0.elapsed();
-        }
 
-        if self.mode == TargetMode::Mmap {
-            let st = self.staging.as_ref().unwrap();
-            let dst = dst.context("Mmap mode needs a destination")?;
             let t0 = Instant::now();
-            unsafe {
-                let range = vk::MappedMemoryRange::default()
-                    .memory(st.memory)
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE);
-                self.device.invalidate_mapped_memory_ranges(&[range])?;
-                let n = st.size.min(dst.len());
-                std::ptr::copy_nonoverlapping(st.ptr, dst.as_mut_ptr(), n);
-            }
+            let range = vk::MappedMemoryRange::default()
+                .memory(memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            d.invalidate_mapped_memory_ranges(&[range])?;
+            std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), size);
             info.copy_time = t0.elapsed();
         }
         Ok(info)
@@ -742,7 +523,7 @@ impl HeadsetCapture {
     }
 
     fn source_view(&mut self, t: &ViewImage) -> Result<vk::ImageView> {
-        let key = (t.image.as_raw(), t.format.as_raw());
+        let key = (t.image.as_raw(), t.format.as_raw(), t.width, t.height);
         if let Some(v) = self.src_views.get(&key) {
             return Ok(*v);
         }
@@ -773,27 +554,23 @@ impl HeadsetCapture {
         Ok(v)
     }
 
-    /// NV12 target: one compute pass samples the view (already in
-    /// SHADER_READ_ONLY_OPTIMAL, so no layout changes on the compositor's
-    /// image) and writes luma + chroma into the buffer.
+    /// One compute pass samples the view (already in SHADER_READ_ONLY_OPTIMAL, so no
+    /// layout changes on the compositor's image) and writes luma + chroma into the
+    /// buffer. Returns the pipeline stage that wrote it.
     fn record_nv12(
         &mut self,
         dst_buffer: vk::Buffer,
-        src: Option<ViewImage>,
+        t: &ViewImage,
     ) -> Result<vk::PipelineStageFlags> {
         let (w, h) = (self.layout.width, self.layout.height);
-        let Some(t) = src else {
-            self.record_fill_nv12(dst_buffer, &[(0, h, [16, 128, 128])]);
-            return Ok(vk::PipelineStageFlags::TRANSFER);
-        };
-        let view = self.source_view(&t)?;
+        let view = self.source_view(t)?;
         let c = self.compute.as_ref().context("compute pipeline missing")?;
         let fmt = t.format;
         let b = t.bounds;
         let params = Nv12Params {
             uv_min: [b.u_min, b.v_min],
             uv_max: [b.u_max, b.v_max],
-            dst_rect: fit_rect(&t, w, h),
+            dst_rect: fit_rect(t, w, h),
             out_size: [w, h],
             stride: self.layout.stride,
             uv_offset: self.layout.uv_offset,
@@ -855,58 +632,23 @@ impl HeadsetCapture {
         Ok(vk::PipelineStageFlags::COMPUTE_SHADER)
     }
 
-    /// Fills row bands of an NV12 target with flat colours (Y, Cb, Cr).
-    fn record_fill_nv12(&self, dst_buffer: vk::Buffer, bands: &[(u32, u32, [u8; 3])]) {
-        let stride = self.layout.stride as u64;
+    /// A black frame: luma 16, chroma 128 over the whole buffer.
+    fn record_black(&self, dst_buffer: vk::Buffer) -> vk::PipelineStageFlags {
         let uv = self.layout.uv_offset as u64;
-        for &(r0, r1, [y, cb, cr]) in bands {
-            let (r0, r1) = (r0 as u64 & !1, (r1 as u64 + 1) & !1);
-            let yw = u32::from_ne_bytes([y; 4]);
-            let cw = u32::from_ne_bytes([cb, cr, cb, cr]);
-            unsafe {
-                self.device.cmd_fill_buffer(
-                    self.cb,
-                    dst_buffer,
-                    r0 * stride,
-                    (r1 - r0) * stride,
-                    yw,
-                );
-                self.device.cmd_fill_buffer(
-                    self.cb,
-                    dst_buffer,
-                    uv + r0 / 2 * stride,
-                    (r1 - r0) / 2 * stride,
-                    cw,
-                );
-            }
+        // SAFETY: recording into this capture's command buffer; the fills stay inside
+        // the buffer (`uv_offset` is a multiple of four, checked in `new`).
+        unsafe {
+            self.device
+                .cmd_fill_buffer(self.cb, dst_buffer, 0, uv, u32::from_ne_bytes([16; 4]));
+            self.device.cmd_fill_buffer(
+                self.cb,
+                dst_buffer,
+                uv,
+                vk::WHOLE_SIZE,
+                u32::from_ne_bytes([128; 4]),
+            );
         }
-    }
-
-    /// Eight horizontal bars: white yellow cyan green magenta red blue black.
-    fn record_test_pattern(&self, dst_buffer: vk::Buffer) {
-        const BARS: [[u8; 3]; 8] = [
-            [255, 255, 255],
-            [255, 255, 0],
-            [0, 255, 255],
-            [0, 255, 0],
-            [255, 0, 255],
-            [255, 0, 0],
-            [0, 0, 255],
-            [0, 0, 0],
-        ];
-        let h = self.layout.height;
-        let bands: Vec<_> = BARS
-            .iter()
-            .enumerate()
-            .map(|(k, c)| {
-                (
-                    h * k as u32 / 8,
-                    h * (k as u32 + 1) / 8,
-                    rgb_to_ycbcr709(*c),
-                )
-            })
-            .collect();
-        self.record_fill_nv12(dst_buffer, &bands);
+        vk::PipelineStageFlags::TRANSFER
     }
 }
 
@@ -915,10 +657,6 @@ impl Drop for HeadsetCapture {
         unsafe {
             let _ = self.device.device_wait_idle();
             self.provider.detach(&self.device);
-            for t in self.targets.drain(..) {
-                self.device.destroy_buffer(t.buffer, None);
-                self.device.free_memory(t.memory, None);
-            }
             if let Some(s) = self.staging.take() {
                 self.device.destroy_buffer(s.buffer, None);
                 self.device.free_memory(s.memory, None);
@@ -952,25 +690,13 @@ fn fit_rect(t: &ViewImage, w: u32, h: u32) -> [i32; 4] {
     [(w as i32 - dw) / 2, (h as i32 - dh) / 2, dw, dh]
 }
 
-/// BT.709 limited-range Y, Cb, Cr of an 8-bit (gamma-encoded) RGB colour.
-pub fn rgb_to_ycbcr709(c: [u8; 3]) -> [u8; 3] {
-    let [r, g, b] = c.map(|v| v as f32 / 255.0);
-    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    let q = |v: f32| v.round().clamp(0.0, 255.0) as u8;
-    [
-        q(16.0 + 219.0 * y),
-        q(128.0 + 224.0 * (b - y) / 1.8556),
-        q(128.0 + 224.0 * (r - y) / 1.5748),
-    ]
-}
-
 /// What the NV12 shader should produce for an RGBA8 UNORM picture of the
-/// output size (no scaling, no bars): the CPU reference for self-tests.
-/// Returns the buffer image (`uv_offset + stride * rows / 2` bytes); bytes
-/// outside the picture are left 0.
-pub fn expected_nv12(rgba: &[u8], width: u32, height: u32, stride: u32, uv_offset: u32) -> Vec<u8> {
-    let (w, h, s) = (width as usize, height as usize, stride as usize);
-    let mut out = vec![0u8; uv_offset as usize + s * h.div_ceil(2)];
+/// output size (no scaling, no bars): the CPU reference for the self-test.
+/// Returns a whole buffer of layout `l`; bytes outside the picture are left 0.
+pub fn expected_nv12(rgba: &[u8], l: &Nv12Layout) -> Vec<u8> {
+    let (w, h, s) = (l.width as usize, l.height as usize, l.stride as usize);
+    let uv_offset = l.uv_offset as usize;
+    let mut out = vec![0u8; l.bytes()];
     let px = |x: usize, y: usize| -> [f32; 3] {
         let i = (y * w + x) * 4;
         [
@@ -996,7 +722,7 @@ pub fn expected_nv12(rgba: &[u8], width: u32, height: u32, stride: u32, uv_offse
                 }
             }
             let y = luma(c);
-            let o = uv_offset as usize + by * s + bx * 2;
+            let o = uv_offset + by * s + bx * 2;
             out[o] = q(128.0 + 224.0 * (c[2] - y) / 1.8556);
             out[o + 1] = q(128.0 + 224.0 * (c[0] - y) / 1.5748);
         }

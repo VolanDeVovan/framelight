@@ -3,6 +3,7 @@ name = "fl-encode"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "iris V4L2 stateful H.264 encoder, raw ioctls"
 
 [dependencies]
 anyhow.workspace = true

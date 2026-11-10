@@ -1,17 +1,14 @@
 //! iris V4L2 stateful encoder (`/dev/video-enc0`) on the Steam Frame.
 //!
-//! NV12 goes in on the OUTPUT queue, H.264 or HEVC Annex-B comes out on the
-//! CAPTURE queue.
+//! NV12 goes in on the OUTPUT queue, H.264 Annex-B comes out on the CAPTURE queue.
 //!
 //! The driver also takes RGBA (`AB24`), but its own RGB->YUV conversion is
 //! BT.709 *full* range while the VUI it writes says *limited* range (and it
 //! ignores the quantization we ask for), so AB24 input decodes with crushed
 //! blacks and clipped whites. With NV12 the GPU does a correct limited-range
 //! conversion, and it is 2.7x less memory traffic for the encoder. The input
-//! buffers are MMAP buffers owned by the driver; [`Encoder::input_dmabuf`]
-//! exports them (VIDIOC_EXPBUF) so the GPU can write frames straight into
-//! them, and [`Encoder::input_map`] gives the CPU mapping for the one-copy
-//! fallback.
+//! buffers are MMAP buffers owned by the driver; [`Encoder::input_map`] is where
+//! the capture copies each frame.
 //!
 //! Driver quirks this code works around (see FrameCast's notes, all
 //! re-checked on the device):
@@ -21,6 +18,8 @@
 //! - buffer timestamps must be real frame times or rate control collapses;
 //! - nothing may block on the OUTPUT queue while frames are in flight, so all
 //!   dequeues here are non-blocking and waiting happens in `poll()`.
+//!
+//! There is no drain or restart: a stream that ends closes the device.
 
 pub mod sys;
 
@@ -32,11 +31,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use fl_core::{Codec, H264Profile};
+use fl_core::{H264Profile, Nv12Layout};
 use sys::*;
 use tracing::{debug, info, warn};
 
 pub const DEFAULT_DEVICE: &str = "/dev/video-enc0";
+
+/// Seconds between scheduled IDRs. Long: viewers ask for a keyframe when they need one.
+const GOP_SECONDS: u32 = 60;
+/// Input (raw) and output (coded) buffers. A few of each: frames are queued one per
+/// tick and come back within a frame or two.
+const NUM_INPUTS: u32 = 3;
+const NUM_OUTPUTS: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct EncoderConfig {
@@ -45,52 +51,10 @@ pub struct EncoderConfig {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
-    pub codec: Codec,
     pub profile: H264Profile,
-    /// Frames between scheduled IDRs. Large: viewers ask for IDRs on loss.
-    pub gop: u32,
-    /// Cyclic intra refresh period in frames (0 = off).
-    pub intra_refresh: u32,
-    pub num_inputs: u32,
-    pub num_outputs: u32,
-    /// Coded fourcc override (e.g. `FWHT` to drive the kernel's `vicodec`
-    /// in tests). When set, the H.264/HEVC-specific controls are skipped.
+    /// Coded fourcc instead of H.264 (`FWHT` drives the kernel's `vicodec` in the
+    /// self-test). When set, the H.264 controls are skipped.
     pub coded_format: Option<u32>,
-}
-
-impl EncoderConfig {
-    pub fn new(width: u32, height: u32, fps: u32, bitrate_kbps: u32, codec: Codec) -> Self {
-        Self {
-            device: DEFAULT_DEVICE.into(),
-            width,
-            height,
-            fps,
-            bitrate_kbps,
-            codec,
-            profile: H264Profile::High,
-            gop: fps.saturating_mul(60).max(1),
-            intra_refresh: 0,
-            num_inputs: 3,
-            num_outputs: 4,
-            coded_format: None,
-        }
-    }
-}
-
-/// Where a frame must be written into an input buffer: single-plane NV12,
-/// luma rows followed by interleaved CbCr rows at `uv_offset`.
-#[derive(Clone, Copy, Debug)]
-pub struct InputLayout {
-    pub width: u32,
-    pub height: u32,
-    /// Bytes per row of both planes.
-    pub stride: u32,
-    /// Byte offset of the chroma plane.
-    pub uv_offset: u32,
-    /// Rows in the buffer (height rounded up by the driver).
-    pub padded_height: u32,
-    /// Bytes the driver expects as `bytesused`.
-    pub size: u32,
 }
 
 /// One encoded access unit.
@@ -124,6 +88,7 @@ fn h264_level_menu(width: u32, height: u32, fps: u32) -> i32 {
         .map_or(16, |l| l.0)
 }
 
+/// A driver buffer mapped into this process.
 struct Mapping {
     ptr: *mut u8,
     len: usize,
@@ -138,24 +103,22 @@ impl Drop for Mapping {
 
 struct InputBuf {
     map: Mapping,
-    dmabuf: OwnedFd,
     queued: bool,
 }
 
 pub struct Encoder {
     fd: OwnedFd,
-    layout: InputLayout,
+    layout: Nv12Layout,
+    /// Bytes the driver expects as `bytesused` of an input.
+    input_size: u32,
     inputs: Vec<InputBuf>,
     outputs: Vec<Mapping>,
     /// (pts_us, time queued) per input in flight, in queue order.
     in_flight: VecDeque<(u64, Instant)>,
     keyframe_pending: bool,
-    /// The encoder returned its LAST buffer (after `drain`).
-    drained: bool,
-    streaming: bool,
 }
 
-// The raw pointers are private mmaps of this encoder's buffers.
+// SAFETY: the raw pointers are private mmaps of this encoder's buffers.
 unsafe impl Send for Encoder {}
 
 fn set_ctrl(fd: RawFd, id: u32, value: i32, name: &str) -> bool {
@@ -172,17 +135,39 @@ fn set_ctrl(fd: RawFd, id: u32, value: i32, name: &str) -> bool {
     }
 }
 
-fn map_buffer(fd: RawFd, type_: u32, index: u32) -> Result<Mapping> {
-    let mut plane: v4l2_plane = zeroed();
+fn bitrate_bps(kbps: u32) -> i32 {
+    (kbps as i64 * 1000).clamp(1, i32::MAX as i64) as i32
+}
+
+fn set_bitrate_ctrls(fd: RawFd, kbps: u32) -> bool {
+    let bps = bitrate_bps(kbps);
+    set_ctrl(fd, CID_MPEG_VIDEO_BITRATE, bps, "bitrate")
+        & set_ctrl(
+            fd,
+            CID_MPEG_VIDEO_BITRATE_PEAK,
+            bps.saturating_add(bps / 2),
+            "peak_bitrate",
+        )
+}
+
+/// A zeroed multi-planar buffer descriptor with one plane.
+fn buffer(type_: u32, plane: &mut v4l2_plane) -> v4l2_buffer {
     let mut b: v4l2_buffer = zeroed();
-    b.index = index;
     b.type_ = type_;
     b.memory = MEMORY_MMAP;
-    b.planes = &mut plane;
+    b.planes = plane;
     b.length = 1;
+    b
+}
+
+fn map_buffer(fd: RawFd, type_: u32, index: u32) -> Result<Mapping> {
+    let mut plane: v4l2_plane = zeroed();
+    let mut b = buffer(type_, &mut plane);
+    b.index = index;
     ioctl(fd, VIDIOC_QUERYBUF, &mut b).context("VIDIOC_QUERYBUF")?;
     let len = plane.length as usize;
-    // SAFETY: mmap of a driver buffer at the offset QUERYBUF reported.
+    // SAFETY: mmap of a driver buffer at the offset QUERYBUF reported; the union holds
+    // `mem_offset` for MMAP buffers.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -202,6 +187,42 @@ fn map_buffer(fd: RawFd, type_: u32, index: u32) -> Result<Mapping> {
     })
 }
 
+fn set_format(fd: RawFd, type_: u32, pixelformat: u32, cfg: &EncoderConfig) -> io::Result<()> {
+    let mut f: v4l2_format = zeroed();
+    f.type_ = type_;
+    f.fmt.pix_mp = v4l2_pix_format_mplane {
+        width: cfg.width,
+        height: cfg.height,
+        pixelformat,
+        num_planes: 1,
+        colorspace: COLORSPACE_REC709,
+        ycbcr_enc: YCBCR_ENC_709,
+        quantization: QUANTIZATION_LIM_RANGE,
+        xfer_func: XFER_FUNC_709,
+        ..Default::default()
+    };
+    ioctl(fd, VIDIOC_S_FMT, &mut f)
+}
+
+fn get_format(fd: RawFd, type_: u32) -> io::Result<v4l2_pix_format_mplane> {
+    let mut f: v4l2_format = zeroed();
+    f.type_ = type_;
+    ioctl(fd, VIDIOC_G_FMT, &mut f)?;
+    // SAFETY: the driver filled the multi-planar member for an MPLANE type.
+    Ok(unsafe { f.fmt.pix_mp })
+}
+
+fn request_buffers(fd: RawFd, type_: u32, count: u32) -> io::Result<u32> {
+    let mut rb = v4l2_requestbuffers {
+        count,
+        type_,
+        memory: MEMORY_MMAP,
+        ..Default::default()
+    };
+    ioctl(fd, VIDIOC_REQBUFS, &mut rb)?;
+    Ok(rb.count)
+}
+
 impl Encoder {
     pub fn open(cfg: &EncoderConfig) -> Result<Self> {
         let path = CString::new(cfg.device.as_str())?;
@@ -219,43 +240,11 @@ impl Encoder {
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let f = fd.as_raw_fd();
 
-        let quant = QUANTIZATION_LIM_RANGE;
-        let raw = PIX_FMT_NV12;
         // Raw input first: the coded size follows from it.
-        let mut of: v4l2_format = zeroed();
-        of.type_ = BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        unsafe {
-            let p = &mut of.fmt.pix_mp;
-            p.width = cfg.width;
-            p.height = cfg.height;
-            p.pixelformat = raw;
-            p.num_planes = 1;
-            p.colorspace = COLORSPACE_REC709;
-            p.ycbcr_enc = YCBCR_ENC_709;
-            p.quantization = quant;
-            p.xfer_func = XFER_FUNC_709;
-        }
-        ioctl(f, VIDIOC_S_FMT, &mut of).context("S_FMT output (raw)")?;
-
-        let coded = match (cfg.coded_format, cfg.codec) {
-            (Some(f), _) => f,
-            (None, Codec::H264) => PIX_FMT_H264,
-            (None, Codec::Hevc) => PIX_FMT_HEVC,
-        };
-        let mut cf: v4l2_format = zeroed();
-        cf.type_ = BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        unsafe {
-            let p = &mut cf.fmt.pix_mp;
-            p.width = cfg.width;
-            p.height = cfg.height;
-            p.pixelformat = coded;
-            p.num_planes = 1;
-            p.colorspace = COLORSPACE_REC709;
-            p.ycbcr_enc = YCBCR_ENC_709;
-            p.quantization = quant;
-            p.xfer_func = XFER_FUNC_709;
-        }
-        ioctl(f, VIDIOC_S_FMT, &mut cf).context("S_FMT capture")?;
+        let coded = cfg.coded_format.unwrap_or(PIX_FMT_H264);
+        set_format(f, BUF_TYPE_VIDEO_OUTPUT_MPLANE, PIX_FMT_NV12, cfg)
+            .context("S_FMT output (raw)")?;
+        set_format(f, BUF_TYPE_VIDEO_CAPTURE_MPLANE, coded, cfg).context("S_FMT capture")?;
 
         // Encode only the visible area, not the padding rows.
         let mut sel = v4l2_selection {
@@ -275,54 +264,42 @@ impl Encoder {
 
         let mut parm: v4l2_streamparm = zeroed();
         parm.type_ = BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        // v4l2_outputparm.timeperframe = 1 / fps.
         parm.parm[2] = 1;
         parm.parm[3] = cfg.fps;
         if let Err(e) = ioctl(f, VIDIOC_S_PARM, &mut parm) {
             warn!("S_PARM: {e}");
         }
 
-        of.type_ = BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        ioctl(f, VIDIOC_G_FMT, &mut of).context("G_FMT output")?;
-        cf.type_ = BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        ioctl(f, VIDIOC_G_FMT, &mut cf).context("G_FMT capture")?;
-        let (op, cp) = unsafe { (of.fmt.pix_mp, cf.fmt.pix_mp) };
-        if op.pixelformat != raw {
-            bail!(
-                "encoder took {} instead of {}",
-                fourcc_str(op.pixelformat),
-                fourcc_str(raw)
-            );
-        }
-        if cp.pixelformat != coded {
-            bail!(
-                "encoder took {} instead of {}",
-                fourcc_str(cp.pixelformat),
-                fourcc_str(coded)
-            );
+        let op = get_format(f, BUF_TYPE_VIDEO_OUTPUT_MPLANE).context("G_FMT output")?;
+        let cp = get_format(f, BUF_TYPE_VIDEO_CAPTURE_MPLANE).context("G_FMT capture")?;
+        for (got, want) in [(op.pixelformat, PIX_FMT_NV12), (cp.pixelformat, coded)] {
+            if got != want {
+                bail!(
+                    "encoder took {} instead of {}",
+                    fourcc_str(got),
+                    fourcc_str(want)
+                );
+            }
         }
         let stride = op.plane_fmt[0].bytesperline;
-        let layout = InputLayout {
-            uv_offset: stride * op.height,
+        let layout = Nv12Layout {
             width: cfg.width,
             height: cfg.height,
             stride,
-            padded_height: op.height,
-            size: op.plane_fmt[0].sizeimage,
+            rows: op.height,
+            uv_offset: stride * op.height,
         };
-        if layout.stride < cfg.width || layout.padded_height < cfg.height {
+        let input_size = op.plane_fmt[0].sizeimage;
+        if layout.stride < cfg.width || layout.rows < cfg.height {
             bail!("encoder input layout too small: {layout:?}");
         }
         info!(
-            "encoder: input {}x{} {} stride {} rows {} size {} (cs {} enc {} q {}); coded {} {}x{} bufsize {}",
-            op.width,
+            "encoder: input {}x{} NV12 stride {} rows {} size {input_size}; coded {} {}x{} bufsize {}",
+            cfg.width,
             cfg.height,
-            fourcc_str(raw),
             layout.stride,
-            layout.padded_height,
-            layout.size,
-            op.colorspace,
-            op.ycbcr_enc,
-            op.quantization,
+            layout.rows,
             fourcc_str(cp.pixelformat),
             cp.width,
             cp.height,
@@ -333,61 +310,45 @@ impl Encoder {
             Self::set_codec_controls(f, cfg);
         }
 
-        let mut rb = v4l2_requestbuffers {
-            count: cfg.num_inputs,
-            type_: BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-            memory: MEMORY_MMAP,
-            ..Default::default()
-        };
-        ioctl(f, VIDIOC_REQBUFS, &mut rb).context("REQBUFS output")?;
+        let count = request_buffers(f, BUF_TYPE_VIDEO_OUTPUT_MPLANE, NUM_INPUTS)
+            .context("REQBUFS output")?;
         let mut inputs = Vec::new();
-        for index in 0..rb.count {
+        for index in 0..count {
             let map = map_buffer(f, BUF_TYPE_VIDEO_OUTPUT_MPLANE, index)?;
-            let mut e = v4l2_exportbuffer {
-                type_: BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-                index,
-                plane: 0,
-                flags: (libc::O_RDWR | libc::O_CLOEXEC) as u32,
-                ..Default::default()
-            };
-            ioctl(f, VIDIOC_EXPBUF, &mut e).context("VIDIOC_EXPBUF")?;
-            // SAFETY: EXPBUF returned a new fd.
-            let dmabuf = unsafe { OwnedFd::from_raw_fd(e.fd) };
-            inputs.push(InputBuf {
-                map,
-                dmabuf,
-                queued: false,
-            });
+            if map.len < layout.bytes() {
+                bail!(
+                    "encoder input buffer is {} bytes, the layout needs {}",
+                    map.len,
+                    layout.bytes()
+                );
+            }
+            inputs.push(InputBuf { map, queued: false });
         }
-
-        let mut rb = v4l2_requestbuffers {
-            count: cfg.num_outputs,
-            type_: BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-            memory: MEMORY_MMAP,
-            ..Default::default()
-        };
-        ioctl(f, VIDIOC_REQBUFS, &mut rb).context("REQBUFS capture")?;
+        let count = request_buffers(f, BUF_TYPE_VIDEO_CAPTURE_MPLANE, NUM_OUTPUTS)
+            .context("REQBUFS capture")?;
         let mut outputs = Vec::new();
-        for index in 0..rb.count {
+        for index in 0..count {
             outputs.push(map_buffer(f, BUF_TYPE_VIDEO_CAPTURE_MPLANE, index)?);
         }
-        info!(
+        if inputs.is_empty() || outputs.is_empty() {
+            bail!("the encoder gave no buffers");
+        }
+        debug!(
             "encoder: {} input buffers of {} bytes, {} output buffers of {} bytes",
             inputs.len(),
-            inputs.first().map_or(0, |b| b.map.len),
+            inputs[0].map.len,
             outputs.len(),
-            outputs.first().map_or(0, |b| b.len)
+            outputs[0].len
         );
 
         let mut enc = Self {
             fd,
             layout,
+            input_size,
             inputs,
             outputs,
             in_flight: VecDeque::new(),
             keyframe_pending: false,
-            drained: false,
-            streaming: false,
         };
         for i in 0..enc.outputs.len() {
             enc.queue_output(i as u32)?;
@@ -396,7 +357,6 @@ impl Encoder {
         ioctl(f, VIDIOC_STREAMON, &mut t).context("STREAMON capture")?;
         let mut t = BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         ioctl(f, VIDIOC_STREAMON, &mut t).context("STREAMON output")?;
-        enc.streaming = true;
         Ok(enc)
     }
 
@@ -408,114 +368,69 @@ impl Encoder {
             BITRATE_MODE_VBR,
             "bitrate_mode",
         );
-        let bps = (cfg.bitrate_kbps as i64 * 1000).clamp(1, i32::MAX as i64) as i32;
-        set_ctrl(f, CID_MPEG_VIDEO_BITRATE, bps, "bitrate");
-        set_ctrl(
-            f,
-            CID_MPEG_VIDEO_BITRATE_PEAK,
-            bps.saturating_add(bps / 2),
-            "peak_bitrate",
-        );
+        set_bitrate_ctrls(f, cfg.bitrate_kbps);
         set_ctrl(f, CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1, "frame_rc");
+        let gop = cfg
+            .fps
+            .saturating_mul(GOP_SECONDS)
+            .clamp(1, i32::MAX as u32);
+        set_ctrl(f, CID_MPEG_VIDEO_GOP_SIZE, gop as i32, "gop");
+        let profile = match cfg.profile {
+            H264Profile::ConstrainedBaseline => H264_PROFILE_CONSTRAINED_BASELINE,
+            H264Profile::Main => H264_PROFILE_MAIN,
+            H264Profile::High => H264_PROFILE_HIGH,
+        };
+        set_ctrl(f, CID_MPEG_VIDEO_H264_PROFILE, profile, "h264_profile");
         set_ctrl(
             f,
-            CID_MPEG_VIDEO_GOP_SIZE,
-            cfg.gop.min(i32::MAX as u32) as i32,
-            "gop",
+            CID_MPEG_VIDEO_H264_LEVEL,
+            h264_level_menu(cfg.width, cfg.height, cfg.fps),
+            "h264_level",
         );
-        match cfg.codec {
-            Codec::H264 => {
-                let profile = match cfg.profile {
-                    H264Profile::ConstrainedBaseline => H264_PROFILE_CONSTRAINED_BASELINE,
-                    H264Profile::Main => H264_PROFILE_MAIN,
-                    H264Profile::High => H264_PROFILE_HIGH,
-                };
-                set_ctrl(f, CID_MPEG_VIDEO_H264_PROFILE, profile, "h264_profile");
-                set_ctrl(
-                    f,
-                    CID_MPEG_VIDEO_H264_LEVEL,
-                    h264_level_menu(cfg.width, cfg.height, cfg.fps),
-                    "h264_level",
-                )
-            }
-            Codec::Hevc => set_ctrl(
-                f,
-                CID_MPEG_VIDEO_HEVC_PROFILE,
-                HEVC_PROFILE_MAIN,
-                "hevc_profile",
-            ),
-        };
         set_ctrl(
             f,
             CID_MPEG_VIDEO_HEADER_MODE,
             HEADER_MODE_JOINED_WITH_1ST_FRAME,
             "header_mode",
         );
+        // A viewer can only start on a keyframe that carries its parameter sets.
         set_ctrl(
             f,
             CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR,
             1,
             "prepend_sps_pps_to_idr",
         );
-        if cfg.intra_refresh > 0 {
-            set_ctrl(
-                f,
-                CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE,
-                INTRA_REFRESH_CYCLIC,
-                "intra_refresh_type",
-            );
-            set_ctrl(
-                f,
-                CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD,
-                cfg.intra_refresh as i32,
-                "intra_refresh_period",
-            );
-        }
     }
 
     /// Changes the target bitrate of the running encoder (takes effect within a few
     /// frames on iris; no restart, no keyframe).
     pub fn set_bitrate(&mut self, kbps: u32) -> Result<()> {
-        let f = self.fd.as_raw_fd();
-        let bps = (kbps as i64 * 1000).clamp(1, i32::MAX as i64) as i32;
-        let ok = set_ctrl(f, CID_MPEG_VIDEO_BITRATE, bps, "bitrate")
-            & set_ctrl(
-                f,
-                CID_MPEG_VIDEO_BITRATE_PEAK,
-                bps.saturating_add(bps / 2),
-                "peak_bitrate",
-            );
-        if !ok {
+        if !set_bitrate_ctrls(self.fd.as_raw_fd(), kbps) {
             bail!("the encoder refused a bitrate change to {kbps} kbit/s");
         }
         Ok(())
     }
 
-    pub fn layout(&self) -> InputLayout {
+    pub fn layout(&self) -> Nv12Layout {
         self.layout
     }
 
-    pub fn num_inputs(&self) -> usize {
-        self.inputs.len()
-    }
-
-    /// The dmabuf behind input buffer `index` (borrowed; dup it to keep it).
-    pub fn input_dmabuf(&self, index: usize) -> &OwnedFd {
-        &self.inputs[index].dmabuf
-    }
-
-    /// CPU mapping of input buffer `index`, for the copy fallback. Only
-    /// write to a buffer that [`Encoder::free_input`] returned.
+    /// CPU mapping of input buffer `index`, to be filled before
+    /// [`Encoder::queue_input`]. Only write to a buffer that
+    /// [`Encoder::free_input`] returned.
     pub fn input_map(&mut self, index: usize) -> &mut [u8] {
         let m = &self.inputs[index].map;
-        // SAFETY: the mapping lives as long as self; the buffer is not queued.
+        // SAFETY: the mapping lives as long as self, and `&mut self` makes this the
+        // only slice into it.
         unsafe { std::slice::from_raw_parts_mut(m.ptr, m.len) }
     }
 
+    /// Frames queued whose output has not come back yet.
     pub fn in_flight(&self) -> usize {
         self.in_flight.len()
     }
 
+    /// Make the next queued frame a keyframe.
     pub fn request_keyframe(&mut self) {
         self.keyframe_pending = true;
     }
@@ -530,11 +445,9 @@ impl Encoder {
     fn reclaim_inputs(&mut self) {
         loop {
             let mut plane: v4l2_plane = zeroed();
-            let mut b: v4l2_buffer = zeroed();
-            b.type_ = BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-            b.memory = MEMORY_MMAP;
-            b.planes = &mut plane;
-            b.length = 1;
+            let mut b = buffer(BUF_TYPE_VIDEO_OUTPUT_MPLANE, &mut plane);
+            // EAGAIN when there is nothing to take back; anything else shows up as a
+            // stalled encoder, which the caller handles.
             if ioctl(self.fd.as_raw_fd(), VIDIOC_DQBUF, &mut b).is_err() {
                 break;
             }
@@ -559,99 +472,35 @@ impl Encoder {
                 "force_key_frame",
             );
         }
+        let len = self.inputs[index].map.len as u32;
         let mut plane: v4l2_plane = zeroed();
-        plane.bytesused = self.layout.size.min(self.inputs[index].map.len as u32);
-        plane.length = self.inputs[index].map.len as u32;
-        let mut b: v4l2_buffer = zeroed();
+        plane.bytesused = self.input_size.min(len);
+        plane.length = len;
+        let mut b = buffer(BUF_TYPE_VIDEO_OUTPUT_MPLANE, &mut plane);
         b.index = index as u32;
-        b.type_ = BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        b.memory = MEMORY_MMAP;
-        b.planes = &mut plane;
-        b.length = 1;
         b.timestamp.tv_sec = (pts_us / 1_000_000) as libc::time_t;
         b.timestamp.tv_usec = (pts_us % 1_000_000) as libc::suseconds_t;
         ioctl(self.fd.as_raw_fd(), VIDIOC_QBUF, &mut b).context("QBUF output")?;
         self.inputs[index].queued = true;
         // Entries leave when their timestamp comes back on an output buffer; a driver
         // that does not copy timestamps must not make this grow for ever.
-        if self.in_flight.len() >= 4 * self.inputs.len().max(1) {
+        if self.in_flight.len() >= 4 * self.inputs.len() {
             self.in_flight.pop_front();
         }
         self.in_flight.push_back((pts_us, Instant::now()));
         Ok(())
     }
 
-    /// Finishes every frame in flight (V4L2_ENC_CMD_STOP) and returns them.
-    /// The encoder then produces nothing until [`Encoder::restart`].
-    pub fn drain(&mut self, timeout: Duration) -> Result<Vec<Packet>> {
-        let mut cmd = v4l2_encoder_cmd {
-            cmd: ENC_CMD_STOP,
-            ..Default::default()
-        };
-        ioctl(self.fd.as_raw_fd(), VIDIOC_ENCODER_CMD, &mut cmd).context("ENCODER_CMD STOP")?;
-        let deadline = Instant::now() + timeout;
-        let mut out = Vec::new();
-        while !self.drained {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                bail!(
-                    "encoder did not finish draining ({} frames still in flight)",
-                    self.in_flight.len()
-                );
-            }
-            if let Some(p) = self.poll_packet(left)? {
-                out.push(p);
-            }
-        }
-        self.reclaim_inputs();
-        self.in_flight.clear();
-        Ok(out)
-    }
-
-    /// Resumes encoding after [`Encoder::drain`]: V4L2_ENC_CMD_START, and
-    /// also a STREAMOFF/STREAMON cycle of the CAPTURE queue, the other resume
-    /// path the spec allows. START alone is not enough everywhere: vicodec
-    /// (kernel 7.3) clears its stopped state before it checks it, so the
-    /// LAST-buffer flag on CAPTURE is never reset and every DQBUF says EPIPE.
-    pub fn restart(&mut self) -> Result<()> {
-        let f = self.fd.as_raw_fd();
-        let mut cmd = v4l2_encoder_cmd {
-            cmd: ENC_CMD_START,
-            ..Default::default()
-        };
-        ioctl(f, VIDIOC_ENCODER_CMD, &mut cmd).context("ENCODER_CMD START")?;
-        let mut t = BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        ioctl(f, VIDIOC_STREAMOFF, &mut t).context("STREAMOFF capture")?;
-        for i in 0..self.outputs.len() {
-            self.queue_output(i as u32)?;
-        }
-        let mut t = BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        ioctl(f, VIDIOC_STREAMON, &mut t).context("STREAMON capture")?;
-        self.drained = false;
-        Ok(())
-    }
-
-    pub fn is_drained(&self) -> bool {
-        self.drained
-    }
-
     fn queue_output(&mut self, index: u32) -> Result<()> {
         let mut plane: v4l2_plane = zeroed();
         plane.length = self.outputs[index as usize].len as u32;
-        let mut b: v4l2_buffer = zeroed();
+        let mut b = buffer(BUF_TYPE_VIDEO_CAPTURE_MPLANE, &mut plane);
         b.index = index;
-        b.type_ = BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        b.memory = MEMORY_MMAP;
-        b.planes = &mut plane;
-        b.length = 1;
         ioctl(self.fd.as_raw_fd(), VIDIOC_QBUF, &mut b).context("QBUF capture")
     }
 
     /// Waits up to `timeout` for an encoded frame. `None` on timeout.
     pub fn poll_packet(&mut self, timeout: Duration) -> Result<Option<Packet>> {
-        if self.drained {
-            return Ok(None);
-        }
         if let Some(p) = self.try_dequeue()? {
             return Ok(Some(p));
         }
@@ -679,59 +528,42 @@ impl Encoder {
             if let Some(p) = self.try_dequeue()? {
                 return Ok(Some(p));
             }
-            if self.drained || Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 return Ok(None);
             }
         }
     }
 
     fn try_dequeue(&mut self) -> Result<Option<Packet>> {
-        let f = self.fd.as_raw_fd();
         loop {
             let mut plane: v4l2_plane = zeroed();
-            let mut b: v4l2_buffer = zeroed();
-            b.type_ = BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-            b.memory = MEMORY_MMAP;
-            b.planes = &mut plane;
-            b.length = 1;
-            if let Err(e) = ioctl(f, VIDIOC_DQBUF, &mut b) {
-                match e.raw_os_error() {
-                    Some(libc::EAGAIN) => return Ok(None),
-                    // After the LAST buffer, until the encoder is restarted.
-                    Some(libc::EPIPE) => {
-                        self.drained = true;
-                        return Ok(None);
-                    }
-                    _ => return Err(e).context("DQBUF capture"),
-                }
+            let mut b = buffer(BUF_TYPE_VIDEO_CAPTURE_MPLANE, &mut plane);
+            if let Err(e) = ioctl(self.fd.as_raw_fd(), VIDIOC_DQBUF, &mut b) {
+                return match e.raw_os_error() {
+                    Some(libc::EAGAIN) => Ok(None),
+                    _ => Err(e).context("DQBUF capture"),
+                };
             }
-            let index = b.index;
+            let (index, flags) = (b.index, b.flags);
             let pts_us = b.timestamp.tv_sec as u64 * 1_000_000 + b.timestamp.tv_usec as u64;
-            let start = plane.data_offset as usize;
-            let end = (plane.bytesused as usize).min(self.outputs[index as usize].len);
-            let data = if end > start {
-                let m = &self.outputs[index as usize];
-                // SAFETY: inside the mapping; the buffer is dequeued.
-                Bytes::copy_from_slice(unsafe {
-                    std::slice::from_raw_parts(m.ptr.add(start), end - start)
-                })
-            } else {
-                Bytes::new()
-            };
-            let flags = b.flags;
+            let m = self
+                .outputs
+                .get(index as usize)
+                .context("the encoder returned a buffer it was never given")?;
+            let end = (plane.bytesused as usize).min(m.len);
+            let start = (plane.data_offset as usize).min(end);
+            // SAFETY: inside the mapping; the buffer is dequeued, so the driver does
+            // not write to it until it is queued again below.
+            let data = Bytes::copy_from_slice(unsafe {
+                std::slice::from_raw_parts(m.ptr.add(start), end - start)
+            });
             self.queue_output(index)?;
             // Opportunistically free inputs too.
             self.reclaim_inputs();
             if flags & BUF_FLAG_ERROR != 0 {
                 warn!("encoder flagged an output buffer as corrupt (pts {pts_us})");
             }
-            if flags & BUF_FLAG_LAST != 0 {
-                self.drained = true;
-            }
             if data.is_empty() {
-                if self.drained {
-                    return Ok(None);
-                }
                 continue;
             }
             // Match to the input with this timestamp (the driver copies it).
@@ -746,12 +578,11 @@ impl Encoder {
                     break;
                 }
             }
-            let encode_time = queued_at.map_or(Duration::ZERO, |t| t.elapsed());
             return Ok(Some(Packet {
                 data,
                 keyframe: flags & BUF_FLAG_KEYFRAME != 0,
                 pts_us,
-                encode_time,
+                encode_time: queued_at.map_or(Duration::ZERO, |t| t.elapsed()),
             }));
         }
     }
@@ -759,15 +590,11 @@ impl Encoder {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
-        if self.streaming {
-            let f = self.fd.as_raw_fd();
-            let mut t = BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-            let _ = ioctl(f, VIDIOC_STREAMOFF, &mut t);
-            let mut t = BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        let f = self.fd.as_raw_fd();
+        for mut t in [BUF_TYPE_VIDEO_OUTPUT_MPLANE, BUF_TYPE_VIDEO_CAPTURE_MPLANE] {
             let _ = ioctl(f, VIDIOC_STREAMOFF, &mut t);
         }
-        // Mappings and fds drop after this (munmap, close); exported dmabufs
-        // keep the memory alive until every importer lets go.
+        // The mappings and the device close after this (fields drop in order).
     }
 }
 

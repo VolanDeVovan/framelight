@@ -8,10 +8,10 @@
 //! SIGUSR1 presses the button, for a shell without a pointer.
 
 use crate::Streamer;
+use crate::signals::{Signal, Signals};
 use anyhow::{Context, Result, bail};
 use fl_webrtc::{Server, SourceState};
-use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::{AsRawFd, RawFd};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
@@ -384,21 +384,23 @@ impl Window {
         Ok(())
     }
 
-    /// Sleeps until the X server has something to say, a signal arrives, or `timeout_ms`
-    /// passes (-1: no limit).
-    fn wait(&self, timeout_ms: i32) {
-        let mut pfd = libc::pollfd {
-            fd: self.conn.stream().as_raw_fd(),
+    /// Sleeps until the X server has something to say, `also` becomes readable, or
+    /// `timeout_ms` passes (-1: no limit).
+    fn wait(&self, also: RawFd, timeout_ms: i32) {
+        let pollfd = |fd| libc::pollfd {
+            fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: one valid pollfd.
-        unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        let mut fds = [pollfd(self.conn.stream().as_raw_fd()), pollfd(also)];
+        // SAFETY: two valid pollfds.
+        unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
     }
 }
 
-pub fn run(streamer: &Streamer, stop: &AtomicBool, press: &AtomicBool) -> Result<()> {
+pub fn run(streamer: &Streamer, signals: &Signals) -> Result<()> {
     let mut win = Window::open()?;
+    // Dropping the server (also on an error return) stops streaming.
     let mut server: Option<Server> = None;
     let mut error: Option<String> = None;
     let mut shown: Option<View> = None;
@@ -412,7 +414,7 @@ pub fn run(streamer: &Streamer, stop: &AtomicBool, press: &AtomicBool) -> Result
     let opened = std::time::Instant::now();
     tracing::info!("window open; streaming is off until it is enabled there");
 
-    'outer: while !stop.load(Ordering::SeqCst) {
+    'outer: loop {
         let status = server.as_ref().map(Server::status);
         let view = View {
             enabled: server.is_some(),
@@ -432,11 +434,20 @@ pub fn run(streamer: &Streamer, stop: &AtomicBool, press: &AtomicBool) -> Result
             dirty = false;
         }
 
-        let mut toggle = press.swap(false, Ordering::SeqCst);
-        if toggle {
-            tracing::info!("button pressed by SIGUSR1");
-        }
+        // Everything that is pending is taken here, and nothing touches the signal
+        // descriptor or the X connection between this and the sleep below, so
+        // whatever arrives later ends that sleep.
+        let mut toggle = false;
         let mut idle = true;
+        while let Some(signal) = signals.try_next() {
+            match signal {
+                Signal::Stop => break 'outer,
+                Signal::Toggle => {
+                    tracing::info!("button pressed by SIGUSR1");
+                    toggle = true;
+                }
+            }
+        }
         while let Some(event) = win.conn.poll_for_event().context("X connection lost")? {
             idle = false;
             match event {
@@ -448,6 +459,8 @@ pub fn run(streamer: &Streamer, stop: &AtomicBool, press: &AtomicBool) -> Result
                         dirty = true;
                     }
                 }
+                // Input is ignored at first: see INPUT_GRACE.
+                Event::ButtonPress(_) | Event::KeyPress(_) if opened.elapsed() < INPUT_GRACE => {}
                 Event::ButtonPress(e)
                     if e.detail == 1 && button.contains(e.event_x as i32, e.event_y as i32) =>
                 {
@@ -466,9 +479,6 @@ pub fn run(streamer: &Streamer, stop: &AtomicBool, press: &AtomicBool) -> Result
                 Event::DestroyNotify(_) => break 'outer,
                 _ => {}
             }
-        }
-        if toggle && opened.elapsed() < INPUT_GRACE {
-            continue;
         }
         if toggle {
             error = None;
@@ -491,11 +501,8 @@ pub fn run(streamer: &Streamer, stop: &AtomicBool, press: &AtomicBool) -> Result
             continue;
         }
         if idle && !dirty {
-            win.wait(if server.is_some() { REFRESH_MS } else { -1 });
+            win.wait(signals.fd(), if server.is_some() { REFRESH_MS } else { -1 });
         }
-    }
-    if let Some(s) = server {
-        s.shutdown();
     }
     Ok(())
 }

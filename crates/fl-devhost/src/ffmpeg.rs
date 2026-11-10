@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use fl_core::{Codec, EncodedFrame, H264Profile, StreamConfig, VideoSource};
+use fl_core::{EncodedFrame, H264Profile, StreamConfig, VideoSource};
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
@@ -19,11 +19,9 @@ pub struct FfmpegSource {
     child: Option<Child>,
     reader: Option<JoinHandle<()>>,
     rx: Option<Receiver<(Vec<u8>, bool)>>,
-    epoch: Instant,
     last_restart: Instant,
     keyframe_pending: bool,
     last_key: Instant,
-    frame_index: u32,
 }
 
 impl FfmpegSource {
@@ -33,11 +31,9 @@ impl FfmpegSource {
             child: None,
             reader: None,
             rx: None,
-            epoch: Instant::now(),
             last_restart: Instant::now() - Duration::from_secs(10),
             keyframe_pending: false,
             last_key: Instant::now(),
-            frame_index: 0,
         }
     }
 
@@ -48,9 +44,6 @@ impl FfmpegSource {
         let gop = fps.to_string();
         let font = (h / 12).max(16);
         let small = (h / 24).max(12);
-        if cfg.codec != Codec::H264 {
-            bail!("the test pattern is H.264 only");
-        }
         let profile = match cfg.profile {
             H264Profile::ConstrainedBaseline => "baseline",
             H264Profile::Main => "main",
@@ -126,8 +119,6 @@ impl VideoSource for FfmpegSource {
     fn start(&mut self, cfg: &StreamConfig) -> Result<()> {
         self.kill();
         self.cfg = Some(cfg.clone());
-        self.epoch = Instant::now();
-        self.frame_index = 0;
         self.keyframe_pending = false;
         self.spawn()
     }
@@ -153,13 +144,10 @@ impl VideoSource for FfmpegSource {
                     self.keyframe_pending = false;
                     self.last_key = Instant::now();
                 }
-                self.frame_index = self.frame_index.wrapping_add(1);
                 Ok(EncodedFrame {
                     data: Bytes::from(data),
                     keyframe,
                     captured: Instant::now(),
-                    pts_us: self.epoch.elapsed().as_micros() as u64,
-                    frame_index: self.frame_index,
                 })
             }
             Err(RecvTimeoutError::Timeout) => bail!("ffmpeg produced no frame for 5 s"),

@@ -10,19 +10,18 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use anyhow::{Context, Result, bail};
 use libloading::Library;
 
-pub const LIB_PATH: &str = "/opt/steamvr/bin/linuxarm64/libopenvr_api.so";
+const LIB_PATH: &str = "/opt/steamvr/bin/linuxarm64/libopenvr_api.so";
 
 const APP_OVERLAY: i32 = 2;
-pub const TEXTURE_TYPE_VULKAN: i32 = 2;
-pub const DEVICE_TYPE_VULKAN: i32 = 1;
-pub const EVENT_QUIT: u32 = 700;
+const TEXTURE_TYPE_VULKAN: i32 = 2;
+const DEVICE_TYPE_VULKAN: i32 = 1;
+const EVENT_QUIT: u32 = 700;
 
 const SYSTEM: &str = "IVRSystem_026";
 const SYSTEM_GET_OUTPUT_DEVICE: usize = 9;
 const SYSTEM_POLL_NEXT_EVENT: usize = 30;
 
 const COMPOSITOR: &str = "IVRCompositor_029";
-const COMPOSITOR_GET_FRAME_TIMINGS: usize = 11;
 const COMPOSITOR_VK_INSTANCE_EXTS: usize = 41;
 const COMPOSITOR_VK_DEVICE_EXTS: usize = 42;
 
@@ -33,10 +32,8 @@ const OVERLAY_VIEW: &str = "IVROverlayView_003";
 const OVERLAY_VIEW_ACQUIRE: usize = 0;
 const OVERLAY_VIEW_RELEASE: usize = 1;
 
-/// sizeof(VREvent_t) and sizeof(Compositor_FrameTiming) with OpenVR's
-/// `#pragma pack(4)` on Linux.
+/// sizeof(VREvent_t) with OpenVR's `#pragma pack(4)` on Linux.
 const EVENT_SIZE: usize = 60;
-const FRAME_TIMING_SIZE: usize = 188;
 
 #[repr(C)]
 pub struct VrVulkanDevice {
@@ -96,20 +93,6 @@ const _: () = {
     assert!(size_of::<VulkanTextureData>() == 64);
 };
 
-/// The fields of Compositor_FrameTiming that matter here.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FrameTiming {
-    pub frame_index: u32,
-    pub num_frame_presents: u32,
-    pub num_mis_presented: u32,
-    pub num_dropped_frames: u32,
-    pub system_time_s: f64,
-    pub total_render_gpu_ms: f32,
-    pub compositor_render_gpu_ms: f32,
-    pub compositor_render_cpu_ms: f32,
-    pub compositor_idle_cpu_ms: f32,
-}
-
 type Table = *const *const c_void;
 
 pub struct OpenVr {
@@ -145,7 +128,7 @@ fn library() -> Result<&'static Library> {
         .map_err(|e| anyhow::anyhow!("dlopen {LIB_PATH}: {e}"))
 }
 
-// The tables are process-global and OpenVR's client calls are IPC.
+// SAFETY: the tables are process-global and OpenVR's client calls are IPC.
 unsafe impl Send for OpenVr {}
 
 /// Is SteamVR's compositor running? Connecting as an overlay app must never
@@ -291,36 +274,6 @@ impl OpenVr {
             unsafe { Self::slot(self.overlay_view, OVERLAY_VIEW_RELEASE) };
         unsafe { f(view) }
     }
-
-    /// The compositor's last `n` frame timings (oldest first).
-    pub fn frame_timings(&self, n: u32) -> Vec<FrameTiming> {
-        let f: unsafe extern "C" fn(*mut u8, u32) -> u32 =
-            unsafe { Self::slot(self.compositor, COMPOSITOR_GET_FRAME_TIMINGS) };
-        let mut buf = vec![0u8; FRAME_TIMING_SIZE * n as usize];
-        for i in 0..n as usize {
-            buf[i * FRAME_TIMING_SIZE..][..4]
-                .copy_from_slice(&(FRAME_TIMING_SIZE as u32).to_ne_bytes());
-        }
-        let got = unsafe { f(buf.as_mut_ptr(), n) }.min(n) as usize;
-        let u = |b: &[u8], o: usize| u32::from_ne_bytes(b[o..o + 4].try_into().unwrap());
-        let fl = |b: &[u8], o: usize| f32::from_ne_bytes(b[o..o + 4].try_into().unwrap());
-        (0..got)
-            .map(|i| {
-                let b = &buf[i * FRAME_TIMING_SIZE..][..FRAME_TIMING_SIZE];
-                FrameTiming {
-                    frame_index: u(b, 4),
-                    num_frame_presents: u(b, 8),
-                    num_mis_presented: u(b, 12),
-                    num_dropped_frames: u(b, 16),
-                    system_time_s: f64::from_ne_bytes(b[24..32].try_into().unwrap()),
-                    total_render_gpu_ms: fl(b, 40),
-                    compositor_render_gpu_ms: fl(b, 44),
-                    compositor_render_cpu_ms: fl(b, 48),
-                    compositor_idle_cpu_ms: fl(b, 52),
-                }
-            })
-            .collect()
-    }
 }
 
 fn split_list(buf: &[u8]) -> Vec<String> {
@@ -341,6 +294,7 @@ pub struct OpenVrProvider {
     view_acquired: bool,
 }
 
+// SAFETY: the boxed structs are only touched through `&mut self`.
 unsafe impl Send for OpenVrProvider {}
 
 impl OpenVrProvider {
@@ -437,10 +391,6 @@ impl crate::provider::ViewProvider for OpenVrProvider {
     fn quit_requested(&mut self) -> bool {
         self.vr.poll_quit()
     }
-
-    fn frame_timings(&self, n: u32) -> Vec<FrameTiming> {
-        self.vr.frame_timings(n)
-    }
 }
 
 #[cfg(test)]
@@ -492,7 +442,6 @@ mod tests {
         assert_eq!(sys[SYSTEM_GET_OUTPUT_DEVICE], "GetOutputDevice");
         assert_eq!(sys[SYSTEM_POLL_NEXT_EVENT], "PollNextEvent");
         let c = slots(&h, "IVRCompositor");
-        assert_eq!(c[COMPOSITOR_GET_FRAME_TIMINGS], "GetFrameTimings");
         assert_eq!(
             c[COMPOSITOR_VK_INSTANCE_EXTS],
             "GetVulkanInstanceExtensionsRequired"

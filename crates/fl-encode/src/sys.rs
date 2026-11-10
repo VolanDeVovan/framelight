@@ -2,7 +2,7 @@
 //! 64-bit Linux (aarch64 and x86_64 share these layouts). Sizes are checked at
 //! compile time against the values `<linux/videodev2.h>` gives.
 
-#![allow(non_camel_case_types, dead_code)]
+#![allow(non_camel_case_types)]
 
 use std::io;
 use std::os::fd::RawFd;
@@ -12,16 +12,12 @@ pub const BUF_TYPE_VIDEO_CAPTURE_MPLANE: u32 = 9;
 pub const BUF_TYPE_VIDEO_OUTPUT_MPLANE: u32 = 10;
 pub const MEMORY_MMAP: u32 = 1;
 pub const SEL_TGT_CROP: u32 = 0;
-pub const ENC_CMD_START: u32 = 0;
-pub const ENC_CMD_STOP: u32 = 1;
 
 pub const BUF_FLAG_KEYFRAME: u32 = 0x0000_0008;
 pub const BUF_FLAG_ERROR: u32 = 0x0000_0040;
-pub const BUF_FLAG_LAST: u32 = 0x0010_0000;
 
 pub const PIX_FMT_NV12: u32 = fourcc(b"NV12");
 pub const PIX_FMT_H264: u32 = fourcc(b"H264");
-pub const PIX_FMT_HEVC: u32 = fourcc(b"HEVC");
 
 pub const COLORSPACE_REC709: u32 = 3;
 pub const XFER_FUNC_709: u8 = 1;
@@ -36,21 +32,15 @@ pub const CID_MPEG_VIDEO_BITRATE_PEAK: u32 = 0x0099_09d0;
 pub const CID_MPEG_VIDEO_FRAME_RC_ENABLE: u32 = 0x0099_09d7;
 pub const CID_MPEG_VIDEO_HEADER_MODE: u32 = 0x0099_09d8;
 pub const CID_MPEG_VIDEO_FORCE_KEY_FRAME: u32 = 0x0099_09e5;
-pub const CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD: u32 = 0x0099_09ec;
-pub const CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE: u32 = 0x0099_09ed;
 pub const CID_MPEG_VIDEO_H264_LEVEL: u32 = 0x0099_0a67;
 pub const CID_MPEG_VIDEO_H264_PROFILE: u32 = 0x0099_0a6b;
-pub const CID_MPEG_VIDEO_HEVC_PROFILE: u32 = 0x0099_0b67;
 pub const CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR: u32 = 0x0099_0b84;
 
 pub const BITRATE_MODE_VBR: i32 = 0;
-pub const BITRATE_MODE_CBR: i32 = 1;
 pub const HEADER_MODE_JOINED_WITH_1ST_FRAME: i32 = 1;
 pub const H264_PROFILE_CONSTRAINED_BASELINE: i32 = 1;
 pub const H264_PROFILE_MAIN: i32 = 2;
 pub const H264_PROFILE_HIGH: i32 = 4;
-pub const HEVC_PROFILE_MAIN: i32 = 0;
-pub const INTRA_REFRESH_CYCLIC: i32 = 1;
 
 pub const VIDIOC_S_FMT: u64 = 0xc0d0_5605;
 pub const VIDIOC_G_FMT: u64 = 0xc0d0_5604;
@@ -58,13 +48,11 @@ pub const VIDIOC_REQBUFS: u64 = 0xc014_5608;
 pub const VIDIOC_QUERYBUF: u64 = 0xc058_5609;
 pub const VIDIOC_QBUF: u64 = 0xc058_560f;
 pub const VIDIOC_DQBUF: u64 = 0xc058_5611;
-pub const VIDIOC_EXPBUF: u64 = 0xc040_5610;
 pub const VIDIOC_STREAMON: u64 = 0x4004_5612;
 pub const VIDIOC_STREAMOFF: u64 = 0x4004_5613;
 pub const VIDIOC_S_CTRL: u64 = 0xc008_561c;
 pub const VIDIOC_S_SELECTION: u64 = 0xc040_565f;
 pub const VIDIOC_S_PARM: u64 = 0xc0cc_5616;
-pub const VIDIOC_ENCODER_CMD: u64 = 0xc028_564d;
 
 pub const fn fourcc(s: &[u8; 4]) -> u32 {
     (s[0] as u32) | (s[1] as u32) << 8 | (s[2] as u32) << 16 | (s[3] as u32) << 24
@@ -173,17 +161,6 @@ pub struct v4l2_buffer {
 
 #[repr(C)]
 #[derive(Default)]
-pub struct v4l2_exportbuffer {
-    pub type_: u32,
-    pub index: u32,
-    pub plane: u32,
-    pub flags: u32,
-    pub fd: i32,
-    pub reserved: [u32; 11],
-}
-
-#[repr(C)]
-#[derive(Default)]
 pub struct v4l2_control {
     pub id: u32,
     pub value: i32,
@@ -215,24 +192,14 @@ pub struct v4l2_streamparm {
     pub parm: [u32; 50],
 }
 
-#[repr(C)]
-#[derive(Default)]
-pub struct v4l2_encoder_cmd {
-    pub cmd: u32,
-    pub flags: u32,
-    pub data: [u32; 8],
-}
-
 const _: () = {
     assert!(size_of::<v4l2_format>() == 208);
     assert!(size_of::<v4l2_pix_format_mplane>() == 192);
     assert!(size_of::<v4l2_buffer>() == 88);
     assert!(size_of::<v4l2_plane>() == 64);
     assert!(size_of::<v4l2_requestbuffers>() == 20);
-    assert!(size_of::<v4l2_exportbuffer>() == 64);
     assert!(size_of::<v4l2_selection>() == 64);
     assert!(size_of::<v4l2_streamparm>() == 204);
-    assert!(size_of::<v4l2_encoder_cmd>() == 40);
     assert!(std::mem::offset_of!(v4l2_buffer, planes) == 64);
 };
 

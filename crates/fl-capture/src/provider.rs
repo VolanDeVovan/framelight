@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use ash::vk;
 
-use crate::openvr::{FrameTiming, TextureBounds};
+use crate::openvr::TextureBounds;
 
 /// The Vulkan objects a provider may need (all owned by the capture).
 pub struct VkHandles<'a> {
@@ -53,10 +53,6 @@ pub trait ViewProvider: Send {
     fn quit_requested(&mut self) -> bool {
         false
     }
-    /// Compositor frame timings, if the runtime has them (oldest first).
-    fn frame_timings(&self, _n: u32) -> Vec<FrameTiming> {
-        Vec::new()
-    }
 }
 
 /// Moving test picture rendered by the GPU-side upload of a CPU pattern.
@@ -82,6 +78,7 @@ struct SynthState {
     fence: vk::Fence,
 }
 
+// SAFETY: the Vulkan handles and the mapped pointer are used from one thread at a time.
 unsafe impl Send for SyntheticProvider {}
 
 impl SyntheticProvider {
@@ -92,11 +89,6 @@ impl SyntheticProvider {
             frame: 0,
             st: None,
         }
-    }
-
-    /// Frame number of the picture the last `acquire` returned.
-    pub fn last_frame(&self) -> u32 {
-        self.frame.wrapping_sub(1)
     }
 
     /// The RGBA picture of frame `n`: horizontal red ramp, vertical green
