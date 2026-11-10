@@ -9,7 +9,7 @@ Watch-only: no input, no remote play, no accounts. Whoever can reach the port ca
 watch; that is the intended trust model for a home LAN.
 
 (The first version was a GameStream host for Moonlight clients. It is in git history
-under the tag `gamestream-final`.)
+under the tag `gamestream-final`; nothing of it is left in the tree.)
 
 ## Hard requirements
 
@@ -29,22 +29,28 @@ SteamVR compositor
        └─ one compute dispatch (nv12.comp: scale + BT.709 limited-range RGB->NV12)
           Not AB24: iris converts AB24 as full range while signalling limited in the VUI.
           The compositor image is only sampled, never transitioned.
-            └─ iris V4L2 stateful encoder /dev/video-enc0 -> H.264 Annex-B
-                 └─ hub: one RTP packetizer + SRTP per viewer (str0m) -> UDP
+            └─ one memcpy into the encoder's mmap'd input buffer
+                 └─ iris V4L2 stateful encoder /dev/video-enc0 -> H.264 Annex-B
+                      └─ hub: one RTP packetizer + SRTP per viewer (str0m) -> UDP
 default sink monitor (dlopen'd libpulse) -> Opus, 20 ms packets -> the same hub
 ```
 
 The compute pass writes a Vulkan host-visible buffer and one memcpy moves it into the
-mmap'd encoder buffer (0.2 ms per frame at 1080p60). Writing straight into the
-encoder's exported dmabuf (`--zero-copy`) is off by default: on the Frame those GPU
-writes reach DRAM after the fence signals, so the encoder reads stale 32-byte lines
-(selftest mismatches that shrink over 30 ms; PSNR dips to 36 dB against the copy
+encoder's buffer (0.2 ms per frame at 1080p60). That copy is the only path.
+
+Writing straight into the encoder's exported dmabuf was tried and removed: on the
+Frame those GPU writes reach DRAM after the fence signals, so the encoder reads stale
+32-byte lines (mismatches that shrink over 30 ms; PSNR dips to 36 dB against the copy
 path). Release barriers to `QUEUE_FAMILY_FOREIGN_EXT` and `DMA_BUF_IOCTL_SYNC` did not
-help. The likely fix is the other direction: allocate exportable memory in Vulkan and
-queue it to the encoder as `V4L2_MEMORY_DMABUF`.
+help. If it is ever worth 0.2 ms, the likely fix is the other direction: allocate
+exportable memory in Vulkan and queue it to the encoder as `V4L2_MEMORY_DMABUF`. The
+removed code is `git show fe01cef^:crates/fl-capture/src/lib.rs` (`import_dmabuf`).
 
 Default mode is 1920x1080 at 60 fps. The Headset View is 2048x1280, so the picture is
 scaled with its aspect kept (thin black bars left and right).
+
+H.264 only, and one GOP per minute: viewers ask for a keyframe when they need one.
+There is no drain and no encoder restart; a stream that ends closes the device.
 
 ## The streamer (`fl-webrtc`)
 
@@ -100,7 +106,13 @@ keyframe, no restart); a source that cannot do that is simply restarted.
 loses its network just goes quiet: after 1.5 s without any packet from it the hub
 stops sending it video (megabits to nowhere crowd the link for the others), after 6 s
 it is forgotten. If it speaks again in between, it resumes at the next keyframe. The
-page reconnects by itself when its connection fails or the picture stalls.
+page reconnects by itself when its connection fails, never gets established, or the
+picture stalls, and says so ("Cannot reach the headset" when `/status` does not answer
+either).
+
+**Switching off.** Disabling (or stopping `serve`) closes every connection properly
+(RTCP BYE, DTLS close_notify), so pages notice at once instead of after the browser's
+ICE timeout, and then keep retrying until streaming is enabled again.
 
 **When there is no picture.** With the headset in standby the compositor is paused and
 hands out no view; the capture then writes black frames, so the stream and every
@@ -110,7 +122,7 @@ for, and the source is retried every 2 s.
 
 **Idle.** Five seconds after the last viewer left, the encoder, Vulkan device, OpenVR
 connection and audio capture are closed. What remains are threads asleep in blocking
-calls (`accept`, `poll`, a channel receive, two condition variables): no timers.
+calls (two in `poll`, a channel receive, two condition variables): no timers.
 
 ## The switch (`framelight app`)
 
@@ -129,24 +141,58 @@ be reachable.
 The window is X11 spoken directly over the socket (`x11rb` without libxcb), an 8x8
 bitmap font compiled in, and a CPU-drawn picture pushed with PutImage only when
 something changes. So the binary still links nothing but libc/libm. While streaming is
-disabled the process is one thread asleep in `poll` on the X socket. The streamer
-lives inside this process: closing the app ends streaming. Input is ignored for the
-first 0.8 s so the click that launched the app cannot press the button. `SIGUSR1`
-presses the button, for a shell.
+disabled the process is one thread asleep in `poll` on the X socket and a signalfd.
+The streamer lives inside this process: closing the app ends streaming. While
+streaming is enabled the window wakes once a second to refresh the viewer count.
+Input is ignored for the first 0.8 s so the click that launched the app cannot press
+the button.
+
+`SIGUSR1` presses the button, for a shell (`pkill -USR1 -x framelight`). `SIGINT`,
+`SIGTERM` and `SIGUSR1` are blocked and read from a signalfd that is polled together
+with the X socket, so a signal cannot fall between "checked" and "asleep".
 
 `framelight serve` is the same streamer without a window, enabled until it is
-stopped.
+stopped (asleep in `poll` on the signalfd).
+
+## Command line
+
+```
+framelight app   [options]     the switch window
+framelight serve [options]     headless
+    --port N  --width W --height H --fps F  --bitrate-kbps B  --no-audio  --synthetic
+framelight probe ...           capture + encode alone, to a file, with timings
+framelight selftest ...        synthetic picture -> GPU NV12 -> encoder, checked
+```
+
+`framelight help` has the details. Unknown options are errors. `--synthetic` replaces
+SteamVR with a moving test picture (the encoder is still the real one). The process
+runs at nice 10, below the game.
 
 ## Threads
 
-Blocking threads, no async runtime. `fl-http` (accept; one short-lived thread per
-request), `fl-udp` (poll on the socket and an eventfd, forwards datagrams), `fl-hub`
-(owns every peer connection; everything reaches it as a message on one channel),
-`fl-video` (capture tick + encoder poll), `fl-audio` (Opus) and the libpulse capture
-thread while someone watches. Nothing is allocated per packet on the capture side; per
-frame there is one copy out of the encoder buffer and one into the shared `Arc`.
+Blocking threads, no async runtime. All of them belong to `fl_webrtc::Server`, which
+starts them in `start` and joins them when it is dropped:
+
+| thread | does | asleep in |
+|--------|------|-----------|
+| `fl-http` | accepts; one short-lived thread per request | `poll` (listener + stop eventfd) |
+| `fl-udp` | forwards datagrams to the hub | `poll` (socket + stop eventfd) |
+| `fl-hub` | owns every peer connection; everything reaches it as a message on one channel | channel receive |
+| `fl-video` | runs the video source while someone watches (capture tick + encoder poll) | a condition variable |
+| `fl-audio` | runs the audio source while someone watches | a condition variable |
+
+plus the libpulse capture thread while someone watches. The hub tells the pumps what
+it wants (run or not, profile, bitrate, keyframe due) through one mutex-protected
+struct; the pumps answer with messages. Stopping raises the eventfd, tells the pumps
+and sends the hub a message: no thread's exit depends on another thread.
+
+Nothing is allocated per packet on the capture side; per frame there is one copy out
+of the encoder buffer and one into the shared `Arc`.
 
 ## Measured on the headset (2026-11-10, 1920x1080@60, H.264 Main)
+
+Taken before the cleanup of the same day, which did not touch the data path (capture,
+encode, packetizing) but did change what sleeps where; not measured again since.
 
 | state | CPU of one core (of 8) |
 |-------|------------------------|
@@ -158,8 +204,9 @@ frame there is one copy out of the encoder buffer and one into the shared `Arc`.
 | each further viewer at 12 Mbit/s | about +2 % (synthetic source: 40.4 -> 42.8 %) |
 
 Capture and encode alone are 2.1 % (`probe`); the rest is audio (0.5 %) and
-packetizing, SRTP and `sendto` per viewer. Compositor GPU time: 2.51 ms mean with
-nobody watching, 2.49-2.64 ms with one or two viewers, no dropped frames. Page open to
+packetizing, SRTP and `sendto` per viewer. Compositor GPU time (from SteamVR's frame
+timings; the tool that read them was removed with the rest of the diagnostics): 2.51 ms
+mean with nobody watching, 2.49-2.64 ms with one or two viewers, no dropped frames. Page open to
 first decoded frame: 250-440 ms on a healthy link (ICE + DTLS 100-260 ms, the source
 starts in ~50 ms and its first frame is a keyframe). Encode latency 9.5 ms mean.
 
@@ -212,22 +259,27 @@ sudo, no system changes, no `systemctl enable`.
 
 To get the switch into the headset's app list, copy `tools/headset/framelight.desktop`
 to `~/.local/share/applications/` on the headset; Steam shows it next to Firefox and
-Telegram as "framelight". Its log is `/home/steamos/framelight/app.log`.
+Telegram as "framelight". Its log is `/home/steamos/framelight/app.log` (the previous
+run's is `app.log.1`).
 
 ## Workspace layout
 
-- `crates/fl-core` — the two source traits and the stream types; nothing else.
-- `crates/fl-capture` — OpenVR Headset View -> NV12 in an encoder buffer (Vulkan compute).
-- `crates/fl-encode` — iris V4L2 stateful encoder, raw ioctls. H.264 for streaming;
-  HEVC is kept for `probe`/`selftest` only.
+- `crates/fl-core` — shared types: the two source traits, what flows through them, and
+  the layout of the encoder's input buffers.
+- `crates/fl-capture` — OpenVR Headset View -> NV12 in an encoder buffer (Vulkan
+  compute); a synthetic picture provider for tests.
+- `crates/fl-encode` — iris V4L2 stateful H.264 encoder, raw ioctls.
 - `crates/fl-audio` — default sink monitor (dlopen'd libpulse) -> Opus; a tone source for tests.
-- `crates/fl-webrtc` — the streamer: HTTP, viewer page, hub, bitrate control. Depends
-  only on the traits, so it runs on the desktop with a synthetic source.
-- `crates/framelight` — the headset binary (`app`, `serve`, plus `probe`/`selftest`/`vrtimings`).
+- `crates/fl-webrtc` — the streamer. Depends only on the traits, so it runs on the
+  desktop with other sources. Modules: `api` (the endpoints), `http`, `net` (UDP
+  receive, stop signal), `hub`, `viewer`, `pump`, `adapt` (bitrate), `clock` (audio
+  timeline), `h264` (SPS and SDP profile parsing), `page.html`.
+- `crates/framelight` — the headset binary: `source` (capture + encode as a
+  `VideoSource`), `ui` (the window), `signals`, `cli`, `probe`, `selftest`.
 - `crates/fl-devhost` — desktop dev host: ffmpeg test pattern, monitor/tone audio.
 - `tools/e2e` — headless-Chromium test of a running streamer.
-- `tools/headset` — the launcher added to Steam, and a CPU measuring helper.
-- `tools/vicodec-vm` — encoder/capture self-tests against the kernel's vicodec in a VM.
+- `tools/headset` — the launcher and its desktop entry, and a CPU measuring helper.
+- `tools/vicodec-vm` — the self-test and a probe against the kernel's vicodec in a VM.
 
 ## Interface between halves
 
@@ -244,11 +296,20 @@ stop() }`. Rules the streamer relies on:
   timestamp and the sender-report clock, so it stays monotonic across source restarts.
   Audio has only a packet count paced by the sound card; the hub anchors it to arrival
   time and re-anchors when the two clocks drift 80 ms apart.
+- `set_bitrate` may fail; the source is then restarted with the new rate.
 
 ## Tests
 
 - `cargo test`, `cargo clippy --all-targets`: SDP/SPS parsing, payload type choice,
-  bitrate control, clocks, HTTP parsing, the window's layout at the headset's sizes.
+  bitrate control, clocks, HTTP parsing and routing, command-line parsing, the
+  window's layout at the headset's sizes.
+- `crates/fl-webrtc/tests/loopback.rs` (part of `cargo test`, 12 s): the whole
+  streamer over 127.0.0.1 with str0m playing the browser and fake sources. Offer and
+  answer, ICE, DTLS, a first frame that is a keyframe with its SPS, two viewers on one
+  encode, PLI, the bitrate endpoint, a goodbye, a viewer that vanishes, linger and
+  idle, restart for the next viewer, shutdown with a viewer connected (which is told),
+  the port bound again at once, and a source that fails to start. It needs no browser,
+  encoder, GPU or sound.
 - End to end on the desktop: `cargo run -p fl-devhost -- --audio tone`, then
   `node tools/e2e/browser-test.mjs http://<LAN address>:8090/ --tabs 2 --bitrate 3000
   --chromium $(nix build --no-link --print-out-paths nixpkgs#chromium)/bin/chromium`.
@@ -257,8 +318,9 @@ stop() }`. Rules the streamer relies on:
   audio energy and the server's status; it fails if a tab decoded nothing. Use the LAN
   address, not 127.0.0.1: browsers gather no loopback candidates.
 - The same script against the headset (`http://frame.local:8090/`).
-- `tools/vicodec-vm/run-vm.sh`: capture and the stateful encoder flow against vicodec
-  with lavapipe, in a throwaway NixOS VM.
+- `tools/vicodec-vm/run-vm.sh`: `framelight selftest` (the shader's output compared
+  byte for byte with a CPU reference; one packet per frame) and a synthetic `probe`
+  against vicodec with lavapipe, in a throwaway NixOS VM.
 - The window: `Xvfb` + `xdotool` (click, Return) + a screenshot.
 
 ## Compared with SFRecorder (GPL-3)
@@ -268,22 +330,27 @@ Read in full; nothing was copied, so the project stays MIT.
 - Capture: SFRecorder reads the panel scanout through KMS with a privileged helper and
   un-warps the lens itself. That needs a root-installed helper (ruled out here) and a
   second undistortion; the Headset View overlay is already the flat picture and needs
-  no privileges. Its GPU stage has the same shape as ours (one compute dispatch into the
-  encoder's dmabuf).
-- Encoder: HEVC only, no keyframe-on-demand, no drain/restart, bindgen at build time.
+  no privileges. Its GPU stage is one compute dispatch into the encoder's dmabuf, the
+  path that showed stale lines here (see Pipeline).
+- Encoder: HEVC only, no keyframe-on-demand, bindgen at build time.
 - Audio: `pa_simple` (blocking reads, link-time libpulse) into AAC. A stream must be
   stoppable at once and the binary must not link device libraries, hence the dlopen'd
   asynchronous API here.
-- Taken as lessons, not code: run below the game for CPU (`--nice`, default 10), and do
+- Taken as lessons, not code: run below the game for CPU (nice 10), and do
   not ask Vulkan for a low global queue priority (it starved on the Frame).
 
 ## Open ends
 
-- No pacing: a keyframe leaves as one burst per viewer. str0m has a pacer and a
-  TWCC-based estimator; they would react faster than receiver-report loss on a link as
-  thin as the Frame's uplink during PC VR streaming.
+- Rate control is crude: loss from receiver reports, in steps at most every 2 s. str0m
+  has a pacer and a TWCC-based estimator; they would react faster on a link as thin as
+  the Frame's uplink during PC VR streaming, and a pacer would stop a keyframe leaving
+  as one burst per viewer.
 - `sendto` per packet; `sendmmsg`/UDP GSO would cut the per-viewer cost.
 - IPv4 only.
+- Zero-copy into the encoder (see Pipeline).
+- Anyone on the network can also call `/bitrate` and `/bye?id=N` (ids are sequential).
+  That is within the trust model (whoever can reach the port may watch), but it does
+  mean one viewer can lower the quality for all or disconnect another.
 - Not tried on a real TV, phone, Firefox or Safari: only headless Chromium 157 on Linux.
 
 ## References (read-only)
