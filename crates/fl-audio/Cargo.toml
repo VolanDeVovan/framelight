@@ -1,0 +1,16 @@
+[package]
+name = "fl-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AudioSource: default sink monitor (dlopen'd libpulse) -> Opus"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+fl-core.workspace = true
+libloading = "0.8"
+# libopus built from the bundled source with cmake and linked statically, so the
+# binary needs no libopus on the device (cross builds with cargo-zigbuild).
+opusic-sys = "0.7"

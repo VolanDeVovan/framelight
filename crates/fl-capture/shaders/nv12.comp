@@ -1,0 +1,70 @@
+#version 450
+// Headset View -> NV12 (BT.709, limited range) straight into the encoder's
+// input buffer. One invocation converts a 4x2 pixel block: two words of luma
+// (one per row) and one word of interleaved chroma (two CbCr pairs).
+//
+// Rebuild with: glslc -O --target-env=vulkan1.1 nv12.comp -o nv12.spv
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src;
+layout(std430, binding = 1) writeonly buffer Dst { uint words[]; };
+
+layout(push_constant) uniform Params {
+    vec2 uvMin;      // Valid area of the source, normalised.
+    vec2 uvMax;
+    ivec4 dstRect;   // Where the picture lands (x, y, w, h); the rest is black.
+    uvec2 outSize;   // Encoded size (multiple of 4 x 2).
+    uint stride;     // Bytes per row of both planes.
+    uint uvOffset;   // Byte offset of the chroma plane.
+    int srgbSource;  // 1 = sampling returns linear light; re-encode.
+    int hasSource;   // 0 = no image yet: write black.
+} p;
+
+vec3 encodeSrgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+
+vec3 fetch(ivec2 px) {
+    ivec2 d = px - p.dstRect.xy;
+    if (p.hasSource == 0 || d.x < 0 || d.y < 0 || d.x >= p.dstRect.z || d.y >= p.dstRect.w)
+        return vec3(0.0);
+    vec2 t = (vec2(d) + 0.5) / vec2(p.dstRect.zw);
+    vec3 c = textureLod(src, mix(p.uvMin, p.uvMax, t), 0.0).rgb;
+    return p.srgbSource == 1 ? encodeSrgb(c) : c;
+}
+
+// BT.709 luma of gamma-encoded RGB, limited range, as a byte.
+uint lumaByte(vec3 c) {
+    float y = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    return uint(clamp(round(16.0 + 219.0 * y), 0.0, 255.0));
+}
+
+uint chromaBytes(vec3 c) {
+    float y = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    float cb = (c.b - y) / 1.8556;
+    float cr = (c.r - y) / 1.5748;
+    uint u = uint(clamp(round(128.0 + 224.0 * cb), 0.0, 255.0));
+    uint v = uint(clamp(round(128.0 + 224.0 * cr), 0.0, 255.0));
+    return u | (v << 8);
+}
+
+void main() {
+    uvec2 blk = gl_GlobalInvocationID.xy;
+    ivec2 base = ivec2(blk.x * 4u, blk.y * 2u);
+    if (base.x >= int(p.outSize.x) || base.y >= int(p.outSize.y)) return;
+
+    vec3 c[2][4];
+    for (int r = 0; r < 2; r++)
+        for (int i = 0; i < 4; i++)
+            c[r][i] = fetch(base + ivec2(i, r));
+
+    for (int r = 0; r < 2; r++) {
+        uint w = lumaByte(c[r][0]) | (lumaByte(c[r][1]) << 8) | (lumaByte(c[r][2]) << 16) | (lumaByte(c[r][3]) << 24);
+        words[((uint(base.y + r)) * p.stride + uint(base.x)) / 4u] = w;
+    }
+    vec3 a = (c[0][0] + c[0][1] + c[1][0] + c[1][1]) * 0.25;
+    vec3 b = (c[0][2] + c[0][3] + c[1][2] + c[1][3]) * 0.25;
+    uint uv = chromaBytes(a) | (chromaBytes(b) << 16);
+    words[(p.uvOffset + blk.y * p.stride + uint(base.x)) / 4u] = uv;
+}

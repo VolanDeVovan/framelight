@@ -1,0 +1,17 @@
+[package]
+name = "fl-devhost"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dev binary: GameStream host with a synthetic ffmpeg test-pattern source"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+fl-core.workspace = true
+fl-gamestream = { path = "../fl-gamestream" }
+fl-audio = { path = "../fl-audio" }
+libc = "0.2"

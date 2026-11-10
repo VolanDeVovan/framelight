@@ -1,0 +1,29 @@
+[package]
+name = "fl-gamestream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Watch-only GameStream (Moonlight-compatible) host"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+fl-core.workspace = true
+
+# Crypto: pure Rust except ring (rustls backend), which cross-compiles with zig.
+aes = "0.8"
+aes-gcm = "0.10"
+cbc = { version = "0.1", features = ["alloc"] }
+sha2 = { version = "0.10", features = ["oid"] }
+rsa = "0.9"
+rand = "0.8"
+hex = "0.4"
+x509-parser = "0.18"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+mdns-sd = "0.21"
+rusty_enet = "0.4"
+libc = "0.2"
+socket2 = "0.6"

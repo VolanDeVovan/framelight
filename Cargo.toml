@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+fl-core = { path = "crates/fl-core" }
+
+[profile.release]
+lto = "thin"
