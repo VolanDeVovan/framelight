@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{{TITLE}}</title>
+<style>
+  :root { color-scheme: dark; --ink: #f2f0ea; --dim: #a9a69c; --panel: rgba(18, 18, 20, .78); --accent: #ffb454; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: #000; color: var(--ink);
+    font: 15px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #note { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 10px; text-align: center; padding: 24px; pointer-events: none; }
+  #note b { font-size: 22px; font-weight: 600; letter-spacing: .01em; }
+  #note span { color: var(--dim); max-width: 34em; }
+  #note.hidden { display: none; }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px;
+    padding: 12px max(16px, env(safe-area-inset-left)) calc(12px + env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, var(--panel) 45%); transition: opacity .25s; }
+  #bar.away { opacity: 0; pointer-events: none; }
+  #stats { color: var(--dim); font-variant-numeric: tabular-nums; margin-right: auto; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  button, select { font: inherit; color: var(--ink); background: rgba(255, 255, 255, .1); border: 1px solid rgba(255, 255, 255, .22);
+    border-radius: 8px; padding: 9px 14px; min-height: 42px; cursor: pointer; }
+  button:hover, select:hover { background: rgba(255, 255, 255, .18); }
+  button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  label { color: var(--dim); display: flex; align-items: center; gap: 8px; }
+  option { background: #1b1b1e; }
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline muted></video>
+<div id="note"><b id="noteTitle">Connecting…</b><span id="noteText"></span></div>
+<div id="bar">
+  <div id="stats"></div>
+  <label>Quality
+    <select id="rate" title="Upper limit for the stream's bitrate; it drops below this on a lossy network">
+      <option value="3000">3 Mbit/s</option>
+      <option value="6000">6 Mbit/s</option>
+      <option value="12000">12 Mbit/s</option>
+      <option value="20000">20 Mbit/s</option>
+      <option value="30000">30 Mbit/s</option>
+    </select>
+  </label>
+  <button id="sound" aria-pressed="false">Sound off</button>
+  <button id="full">Fullscreen</button>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const video = $("v"), bar = $("bar");
+let pc = null, viewerId = null, generation = 0, retryTimer = null;
+let last = null, stalledFor = 0;
+// For tests and the curious: the latest numbers from getStats().
+window.flStats = { state: "new", framesDecoded: 0 };
+
+function note(title, text) {
+  $("note").classList.toggle("hidden", !title);
+  $("noteTitle").textContent = title || "";
+  $("noteText").textContent = text || "";
+}
+
+function bye() {
+  if (viewerId !== null) navigator.sendBeacon("/bye?id=" + viewerId);
+  viewerId = null;
+}
+
+function retry(delay) {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(connect, delay);
+}
+
+async function connect() {
+  const mine = ++generation;
+  clearTimeout(retryTimer);
+  if (pc) { pc.close(); bye(); }
+  last = null; stalledFor = 0;
+  if (!window.RTCPeerConnection) { note("This browser has no WebRTC", "Try a current Chrome, Firefox or Safari."); return; }
+  pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
+  const stream = new MediaStream();
+  video.srcObject = stream;
+  pc.ontrack = (e) => {
+    stream.addTrack(e.track);
+    // Spectating wants the freshest picture, not a smooth buffer.
+    try { e.receiver.jitterBufferTarget = 0; } catch (_) {}
+    try { e.receiver.playoutDelayHint = 0; } catch (_) {}
+    video.play().catch(() => {});
+  };
+  pc.onconnectionstatechange = () => {
+    if (mine !== generation) return;
+    window.flStats.state = pc.connectionState;
+    if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+      note("Connection lost", "Trying again…");
+      retry(1500);
+    }
+  };
+  pc.addTransceiver("video", { direction: "recvonly" });
+  pc.addTransceiver("audio", { direction: "recvonly" });
+  try {
+    await pc.setLocalDescription(await pc.createOffer());
+    const res = await fetch("/offer", { method: "POST", headers: { "Content-Type": "application/sdp" }, body: pc.localDescription.sdp });
+    if (mine !== generation) return;
+    if (!res.ok) {
+      note("Cannot start the stream", await res.text());
+      retry(5000);
+      return;
+    }
+    viewerId = res.headers.get("Viewer-Id");
+    await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
+  } catch (e) {
+    if (mine !== generation) return;
+    note("Cannot reach the headset", "Streaming may be switched off. Trying again…");
+    retry(2500);
+  }
+}
+
+async function showStatus() {
+  try {
+    const s = await (await fetch("/status")).json();
+    const rate = $("rate");
+    if (![...rate.options].some((o) => +o.value === s.ceiling_kbps)) {
+      // Started with a ceiling that is not one of the presets.
+      rate.add(new Option((s.ceiling_kbps / 1000).toFixed(1).replace(/\.0$/, "") + " Mbit/s", s.ceiling_kbps));
+    }
+    rate.value = String(s.ceiling_kbps);
+    return s;
+  } catch (_) { return null; }
+}
+
+async function poll() {
+  if (!pc || pc.connectionState !== "connected") return;
+  let v = null;
+  (await pc.getStats()).forEach((r) => { if (r.type === "inbound-rtp" && r.kind === "video") v = r; });
+  // No packet yet means no stats entry yet: the same as nothing decoded.
+  if (!v) v = { framesDecoded: 0, bytesReceived: 0 };
+  const now = performance.now();
+  const s = window.flStats;
+  if (last) {
+    const dt = (now - last.t) / 1000;
+    s.kbps = Math.round((v.bytesReceived - last.bytes) * 8 / dt / 1000);
+    s.fps = Math.round((v.framesDecoded - last.frames) / dt);
+    const emitted = (v.jitterBufferEmittedCount || 0) - last.emitted;
+    s.bufferMs = emitted > 0 ? Math.round(((v.jitterBufferDelay || 0) - last.delay) / emitted * 1000) : 0;
+    stalledFor = v.framesDecoded === last.frames ? stalledFor + dt : 0;
+  }
+  last = { t: now, bytes: v.bytesReceived, frames: v.framesDecoded, emitted: v.jitterBufferEmittedCount || 0, delay: v.jitterBufferDelay || 0 };
+  Object.assign(s, { framesDecoded: v.framesDecoded, width: v.frameWidth || 0, height: v.frameHeight || 0,
+    packetsLost: v.packetsLost || 0, keyFramesDecoded: v.keyFramesDecoded || 0, decoder: v.decoderImplementation || "" });
+  if (v.framesDecoded > 0 && stalledFor < 2) {
+    note(null);
+    $("stats").textContent = `${s.width}×${s.height} · ${s.fps || 0} fps · ${((s.kbps || 0) / 1000).toFixed(1)} Mbit/s · buffer ${s.bufferMs || 0} ms`;
+  } else {
+    const st = await showStatus();
+    if (st && st.source === "failed") note("Waiting for the headset", st.error);
+    else if (stalledFor >= 2) note("Waiting for the picture…", "");
+    // The picture should be flowing and is not (or the streamer is gone): start over.
+    if (stalledFor > 8 && (!st || st.source === "running")) connect();
+  }
+}
+
+$("rate").onchange = async () => {
+  try { await fetch("/bitrate?kbps=" + $("rate").value, { method: "POST" }); } catch (_) {}
+};
+$("sound").onclick = () => {
+  video.muted = !video.muted;
+  $("sound").textContent = video.muted ? "Sound off" : "Sound on";
+  $("sound").setAttribute("aria-pressed", String(!video.muted));
+  video.play().catch(() => {});
+};
+$("full").onclick = () => {
+  const el = document.documentElement;
+  if (document.fullscreenElement) document.exitFullscreen();
+  else if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+  else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
+};
+
+let hideTimer = null;
+function wake() {
+  bar.classList.remove("away");
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(() => { if (!bar.contains(document.activeElement) || document.activeElement === document.body) bar.classList.add("away"); }, 4000);
+}
+["pointermove", "pointerdown", "keydown", "touchstart"].forEach((e) => addEventListener(e, wake, { passive: true }));
+addEventListener("pagehide", () => { bye(); });
+addEventListener("pageshow", (e) => { if (e.persisted) connect(); });
+
+wake();
+showStatus();
+connect();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>

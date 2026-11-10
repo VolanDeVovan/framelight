@@ -1,0 +1,16 @@
+[package]
+name = "fl-webrtc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Watch-only WebRTC streamer: one encode fanned out to any number of browsers"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+fl-core.workspace = true
+libc = "0.2"
+# Sans-IO WebRTC (ICE, DTLS, SRTP, RTP packetizing, NACK/RTX); no async runtime.
+# aws-lc-rs is the crypto backend: it cross-compiles with zig and has NEON/ARMv8 AES.
+str0m = { version = "0.25", default-features = false, features = ["aws-lc-rs"] }

@@ -1,12 +1,12 @@
 //! [`MonitorAudioSource`]: what the device plays (the default sink's monitor), as
-//! 48 kHz stereo CBR Opus packets of the duration the client negotiated.
+//! 48 kHz stereo CBR Opus packets of [`PACKET_MS`] each.
 //!
 //! A capture thread (see [`pulse`]) records `@DEFAULT_MONITOR@` through a dlopen'd
 //! libpulse (pipewire-pulse on SteamOS and the desktop) with one-packet fragments into a
 //! small bounded ring. [`AudioSource::next_packet`] takes one packet of samples as soon
 //! as they are there, so pacing follows the sound card's clock. When no data comes
 //! (server down, sink suspended, capture stalled) it falls back to encoded silence at
-//! real-time pace after [`STALL_SLACK`], so the client's audio clock never starves.
+//! real-time pace after [`STALL_SLACK`], so the viewers' audio clock never starves.
 
 mod opus;
 mod pulse;
@@ -32,18 +32,14 @@ const RING_MS: u32 = 60;
 /// Behind by more than this (suspend, debugger): resync instead of bursting silence.
 const RESYNC: Duration = Duration::from_millis(200);
 
-/// The Opus frame size to use for a client that asked for `ms` per packet: the largest
-/// one that fits.
-fn packet_duration(ms: u32) -> u32 {
-    [20, 10, 5].into_iter().find(|&d| d <= ms).unwrap_or(5)
-}
+/// Opus packet duration: what browsers expect by default (`ptime` 20).
+pub const PACKET_MS: u32 = 20;
 
 pub struct MonitorAudioSource {
     /// Opus bitrate (CBR), bits per second.
     pub bitrate: u32,
     /// Opus encoder complexity, 0..=10.
     pub complexity: u32,
-    packet_ms: u32,
     /// libpulse, loaded on the first start; `None` if it is not available.
     pulse: Option<Arc<pulse::Pulse>>,
     run: Option<Running>,
@@ -72,27 +68,23 @@ impl Default for MonitorAudioSource {
 
 impl MonitorAudioSource {
     pub fn new() -> Self {
-        Self { bitrate: 96_000, complexity: 5, packet_ms: 5, pulse: None, run: None }
+        Self { bitrate: 96_000, complexity: 5, pulse: None, run: None }
     }
 }
 
 impl AudioSource for MonitorAudioSource {
-    fn set_packet_duration(&mut self, ms: u32) {
-        self.packet_ms = packet_duration(ms);
-    }
-
     fn start(&mut self) -> Result<()> {
         self.stop();
         if self.pulse.is_none() {
             match pulse::Pulse::load() {
                 Ok(p) => self.pulse = Some(Arc::new(p)),
-                // Keep the client's audio clock fed anyway: silence at real-time pace.
+                // Keep the viewers' audio clock fed anyway: silence at real-time pace.
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "audio: cannot capture the monitor; sending silence")
                 }
             }
         }
-        let frame = (RATE * self.packet_ms / 1000) as usize * CHANNELS;
+        let frame = (RATE * PACKET_MS / 1000) as usize * CHANNELS;
         let cap = (RATE * RING_MS / 1000) as usize * CHANNELS;
         let shared = Arc::new(pulse::Shared::new(cap, frame));
         let enc = opus::Encoder::new(RATE, CHANNELS as u32, self.bitrate, self.complexity)?;
@@ -109,13 +101,13 @@ impl AudioSource for MonitorAudioSource {
             }
             None => None,
         };
-        tracing::info!(packet_ms = self.packet_ms, bitrate = self.bitrate, "audio: monitor source started");
+        tracing::info!(packet_ms = PACKET_MS, bitrate = self.bitrate, "audio: monitor source started");
         self.run = Some(Running {
             shared,
             thread,
             enc,
             frame,
-            packet: Duration::from_millis(self.packet_ms as u64),
+            packet: Duration::from_millis(PACKET_MS as u64),
             pcm: vec![0; frame],
             out: vec![0; 1500],
             base: Instant::now(),

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use fl_core::Codec;
+use fl_core::{Codec, H264Profile};
 use sys::*;
 use tracing::{debug, info, warn};
 
@@ -46,7 +46,8 @@ pub struct EncoderConfig {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub codec: Codec,
-    /// Frames between scheduled IDRs. Large: clients ask for IDRs on loss.
+    pub profile: H264Profile,
+    /// Frames between scheduled IDRs. Large: viewers ask for IDRs on loss.
     pub gop: u32,
     /// Cyclic intra refresh period in frames (0 = off).
     pub intra_refresh: u32,
@@ -66,6 +67,7 @@ impl EncoderConfig {
             fps,
             bitrate_kbps,
             codec,
+            profile: H264Profile::High,
             gop: fps.saturating_mul(60).max(1),
             intra_refresh: 0,
             num_inputs: 3,
@@ -99,6 +101,24 @@ pub struct Packet {
     pub pts_us: u64,
     /// QBUF of the input to DQBUF of this output.
     pub encode_time: Duration,
+}
+
+/// `V4L2_MPEG_VIDEO_H264_LEVEL_*` menu index of the lowest level that allows the mode
+/// (Table A-1: macroblocks per second and frame size), from 3.1 up.
+fn h264_level_menu(width: u32, height: u32, fps: u32) -> i32 {
+    let mbs = width.div_ceil(16) * height.div_ceil(16);
+    let rate = mbs * fps;
+    // (menu index, MaxMBPS, MaxFS): 3.1, 3.2, 4, 4.2, 5, 5.1, 5.2
+    const LEVELS: [(i32, u32, u32); 7] = [
+        (9, 108_000, 3_600),
+        (10, 216_000, 5_120),
+        (11, 245_760, 8_192),
+        (13, 522_240, 8_704),
+        (14, 589_824, 22_080),
+        (15, 983_040, 36_864),
+        (16, 2_073_600, 36_864),
+    ];
+    LEVELS.iter().find(|&&(_, mbps, fs)| rate <= mbps && mbs <= fs).map_or(16, |l| l.0)
 }
 
 struct Mapping {
@@ -401,12 +421,20 @@ impl Encoder {
             "gop",
         );
         match cfg.codec {
-            Codec::H264 => set_ctrl(
-                f,
-                CID_MPEG_VIDEO_H264_PROFILE,
-                H264_PROFILE_HIGH,
-                "h264_profile",
-            ),
+            Codec::H264 => {
+                let profile = match cfg.profile {
+                    H264Profile::ConstrainedBaseline => H264_PROFILE_CONSTRAINED_BASELINE,
+                    H264Profile::Main => H264_PROFILE_MAIN,
+                    H264Profile::High => H264_PROFILE_HIGH,
+                };
+                set_ctrl(f, CID_MPEG_VIDEO_H264_PROFILE, profile, "h264_profile");
+                set_ctrl(
+                    f,
+                    CID_MPEG_VIDEO_H264_LEVEL,
+                    h264_level_menu(cfg.width, cfg.height, cfg.fps),
+                    "h264_level",
+                )
+            }
             Codec::Hevc => set_ctrl(
                 f,
                 CID_MPEG_VIDEO_HEVC_PROFILE,
@@ -440,6 +468,19 @@ impl Encoder {
                 "intra_refresh_period",
             );
         }
+    }
+
+    /// Changes the target bitrate of the running encoder (takes effect within a few
+    /// frames on iris; no restart, no keyframe).
+    pub fn set_bitrate(&mut self, kbps: u32) -> Result<()> {
+        let f = self.fd.as_raw_fd();
+        let bps = (kbps as i64 * 1000).clamp(1, i32::MAX as i64) as i32;
+        let ok = set_ctrl(f, CID_MPEG_VIDEO_BITRATE, bps, "bitrate")
+            & set_ctrl(f, CID_MPEG_VIDEO_BITRATE_PEAK, bps.saturating_add(bps / 2), "peak_bitrate");
+        if !ok {
+            bail!("the encoder refused a bitrate change to {kbps} kbit/s");
+        }
+        Ok(())
     }
 
     pub fn layout(&self) -> InputLayout {
@@ -719,5 +760,20 @@ impl Drop for Encoder {
         }
         // Mappings and fds drop after this (munmap, close); exported dmabufs
         // keep the memory alive until every importer lets go.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::h264_level_menu;
+
+    #[test]
+    fn level_follows_the_mode() {
+        assert_eq!(h264_level_menu(1280, 720, 30), 9); // 3.1
+        assert_eq!(h264_level_menu(1280, 720, 60), 10); // 3.2
+        assert_eq!(h264_level_menu(1920, 1080, 30), 11); // 4
+        assert_eq!(h264_level_menu(1920, 1080, 60), 13); // 4.2
+        assert_eq!(h264_level_menu(2560, 1440, 60), 15); // 5.1
+        assert_eq!(h264_level_menu(3840, 2160, 60), 16); // 5.2
     }
 }

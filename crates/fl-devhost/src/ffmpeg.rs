@@ -1,12 +1,13 @@
 //! A [`VideoSource`] backed by an `ffmpeg` child process: `testsrc2` plus a wall clock,
-//! stream time and frame counter, encoded with libx264/libx265 (ultrafast, zerolatency,
-//! no B-frames) to Annex-B on stdout. AUD NALs (inserted by a bitstream filter) delimit
-//! access units. Keyframes: periodic, every second (GOP = fps), which answers keyframe
-//! requests within a second; ffmpeg is restarted only if no keyframe shows up at all.
+//! stream time and frame counter, encoded with libx264 (ultrafast, zerolatency, no
+//! B-frames, parameter sets on every IDR) to Annex-B on stdout. AUD NALs (inserted by a
+//! bitstream filter) delimit access units. Keyframes: periodic, every second (GOP = fps),
+//! which answers keyframe requests within a second; ffmpeg is restarted only if no
+//! keyframe shows up at all. A bitrate change is a restart too.
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use fl_core::{Codec, EncodedFrame, StreamConfig, VideoSource};
+use fl_core::{Codec, EncodedFrame, H264Profile, StreamConfig, VideoSource};
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
@@ -47,28 +48,47 @@ impl FfmpegSource {
         let gop = fps.to_string();
         let font = (h / 12).max(16);
         let small = (h / 24).max(12);
+        if cfg.codec != Codec::H264 {
+            bail!("the test pattern is H.264 only");
+        }
+        let profile = match cfg.profile {
+            H264Profile::ConstrainedBaseline => "baseline",
+            H264Profile::Main => "main",
+            H264Profile::High => "high",
+        };
         let vf = format!(
             "testsrc2=size={w}x{h}:rate={fps},\
              drawtext=text='%{{localtime\\:%X}}':fontsize={font}:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12:x=(w-tw)/2:y=h/2-th,\
-             drawtext=text='stream %{{pts\\:hms}}  frame %{{n}}  {w}x{h}@{fps} {codec}':fontsize={small}:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8:x=(w-tw)/2:y=h/2+{font}",
-            codec = match cfg.codec {
-                Codec::H264 => "H.264",
-                Codec::Hevc => "HEVC",
-            }
+             drawtext=text='stream %{{pts\\:hms}}  frame %{{n}}  {w}x{h}@{fps} {profile} {kbps}k':fontsize={small}:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8:x=(w-tw)/2:y=h/2+{font}"
         );
         let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-re", "-f", "lavfi", "-i", &vf]);
-        match cfg.codec {
-            Codec::H264 => cmd.args([
-                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-profile:v", "high",
-                "-x264-params", "repeat-headers=1", "-bsf:v", "h264_metadata=aud=insert", "-f", "h264",
-            ]),
-            Codec::Hevc => cmd.args([
-                "-c:v", "libx265", "-preset", "ultrafast", "-tune", "zerolatency",
-                "-x265-params", "repeat-headers=1:log-level=error", "-bsf:v", "hevc_metadata=aud=insert",
-                "-f", "hevc",
-            ]),
-        };
+        cmd.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+            &vf,
+        ]);
+        cmd.args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-profile:v",
+            profile,
+            "-x264-params",
+            "repeat-headers=1",
+            "-bsf:v",
+            "h264_metadata=aud=insert",
+            "-f",
+            "h264",
+        ]);
         cmd.args(["-pix_fmt", "yuv420p", "-g", &gop, "-bf", "0"])
             .args(["-b:v", &format!("{kbps}k"), "-maxrate", &format!("{kbps}k")])
             .args(["-bufsize", &format!("{}k", (kbps / fps).max(100) * 2)])
@@ -79,11 +99,10 @@ impl FfmpegSource {
         let mut child = cmd.spawn().context("spawn ffmpeg (is it on PATH?)")?;
         let stdout = child.stdout.take().context("ffmpeg stdout")?;
         let (tx, rx) = sync_channel(4);
-        let codec = cfg.codec;
         let reader = std::thread::Builder::new()
             .name("ffmpeg-reader".into())
-            .spawn(move || read_access_units(stdout, codec, tx))?;
-        tracing::info!(w, h, fps, kbps, codec = ?cfg.codec, "ffmpeg test pattern started");
+            .spawn(move || read_access_units(stdout, tx))?;
+        tracing::info!(w, h, fps, kbps, profile, "ffmpeg test pattern started");
         self.child = Some(child);
         self.reader = Some(reader);
         self.rx = Some(rx);
@@ -114,15 +133,20 @@ impl VideoSource for FfmpegSource {
     }
 
     fn next_frame(&mut self) -> Result<EncodedFrame> {
-        // Restart-on-request is only a fallback for when periodic IDRs stall: a restart
-        // bursts frames and can overflow the client's decode queue, which asks again.
-        if self.keyframe_pending && self.last_restart.elapsed() >= Duration::from_secs(3) && self.last_key.elapsed() >= Duration::from_secs(2) {
+        // Restart-on-request is only a fallback for when periodic IDRs stall.
+        if self.keyframe_pending
+            && self.last_restart.elapsed() >= Duration::from_secs(3)
+            && self.last_key.elapsed() >= Duration::from_secs(2)
+        {
             self.keyframe_pending = false;
             tracing::info!("keyframe requested and none arrived: restarting the encoder");
             self.kill();
             self.spawn()?;
         }
-        let rx = self.rx.as_ref().ok_or_else(|| anyhow!("source not started"))?;
+        let rx = self
+            .rx
+            .as_ref()
+            .ok_or_else(|| anyhow!("source not started"))?;
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok((data, keyframe)) => {
                 if keyframe {
@@ -133,6 +157,7 @@ impl VideoSource for FfmpegSource {
                 Ok(EncodedFrame {
                     data: Bytes::from(data),
                     keyframe,
+                    captured: Instant::now(),
                     pts_us: self.epoch.elapsed().as_micros() as u64,
                     frame_index: self.frame_index,
                 })
@@ -149,6 +174,10 @@ impl VideoSource for FfmpegSource {
         self.keyframe_pending = true;
     }
 
+    fn set_bitrate(&mut self, kbps: u32) -> Result<()> {
+        bail!("ffmpeg takes its bitrate ({kbps} kbit/s asked) on the command line only")
+    }
+
     fn stop(&mut self) {
         self.kill();
         tracing::info!("ffmpeg test pattern stopped");
@@ -156,15 +185,9 @@ impl VideoSource for FfmpegSource {
 }
 
 /// Split the Annex-B byte stream into access units at AUD NALs.
-fn read_access_units(mut r: impl Read, codec: Codec, tx: SyncSender<(Vec<u8>, bool)>) {
-    let is_aud = |b: u8| match codec {
-        Codec::H264 => b & 0x1f == 9,
-        Codec::Hevc => (b >> 1) & 0x3f == 35,
-    };
-    let is_irap = |b: u8| match codec {
-        Codec::H264 => b & 0x1f == 5,
-        Codec::Hevc => (16..=21).contains(&((b >> 1) & 0x3f)),
-    };
+fn read_access_units(mut r: impl Read, tx: SyncSender<(Vec<u8>, bool)>) {
+    let is_aud = |b: u8| b & 0x1f == 9;
+    let is_irap = |b: u8| b & 0x1f == 5;
     let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
     let mut chunk = vec![0u8; 256 * 1024];
     // Start of the current AU in `buf`, and how far we have scanned for start codes.
@@ -207,5 +230,6 @@ fn read_access_units(mut r: impl Read, codec: Codec, tx: SyncSender<(Vec<u8>, bo
 }
 
 fn has_nal(au: &[u8], pred: impl Fn(u8) -> bool) -> bool {
-    au.windows(4).any(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && pred(w[3]))
+    au.windows(4)
+        .any(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && pred(w[3]))
 }

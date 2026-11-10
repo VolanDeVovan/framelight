@@ -5,7 +5,11 @@
 //! so a finished frame is returned the moment the encoder hands it over.
 //!
 //! Everything (encoder, Vulkan device, OpenVR connection) is opened in `start`
-//! and dropped in `stop`: nothing is held while no client is watching.
+//! and dropped in `stop`: nothing is held while nobody is watching.
+//!
+//! While the headset is in standby the compositor is paused and hands out no view;
+//! the capture then writes black frames, so the stream (and every viewer's
+//! connection) stays up and the picture returns by itself.
 
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
@@ -21,10 +25,10 @@ use fl_encode::{Encoder, EncoderConfig};
 use tracing::{info, warn};
 
 /// No encoded frame for this long while frames are queued means the encoder is stuck;
-/// `next_frame` then fails so the stream ends and the next one reopens the device.
+/// `next_frame` then fails and the caller starts the source again, reopening the device.
 const ENCODER_STALL: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct SourceOptions {
     /// Opt-in dmabuf (zero-copy) path, falling back to mmap on failure. Off by default:
     /// on the Frame the encoder read GPU writes to its exported buffers late (stale
@@ -43,19 +47,6 @@ pub struct SourceOptions {
     pub coded_format: Option<u32>,
 }
 
-impl Default for SourceOptions {
-    fn default() -> Self {
-        Self {
-            zero_copy: false,
-            gop: 0,
-            intra_refresh: 0,
-            test_pattern: false,
-            synthetic: false,
-            device: None,
-            coded_format: None,
-        }
-    }
-}
 
 /// Per-frame numbers for the probe.
 #[derive(Clone, Copy, Debug, Default)]
@@ -111,11 +102,16 @@ impl VideoSource for HeadsetSource {
         if cfg.fps == 0 || cfg.width == 0 || cfg.height == 0 {
             bail!("bad stream config {cfg:?}");
         }
+        // Fail before touching the encoder: this is retried while viewers wait.
+        if !self.opts.synthetic && !fl_capture::openvr::steamvr_running() {
+            bail!("SteamVR is not running on the headset");
+        }
         let mut ec =
             EncoderConfig::new(cfg.width, cfg.height, cfg.fps, cfg.bitrate_kbps, cfg.codec);
         if self.opts.gop > 0 {
             ec.gop = self.opts.gop;
         }
+        ec.profile = cfg.profile;
         ec.intra_refresh = self.opts.intra_refresh;
         if let Some(d) = &self.opts.device {
             ec.device = d.clone();
@@ -157,11 +153,12 @@ impl VideoSource for HeadsetSource {
         let period = Duration::from_nanos(1_000_000_000 / cfg.fps as u64);
         let now = Instant::now();
         info!(
-            "headset source: {}x{} @{} {:?} {} kbit/s, {:?}",
+            "headset source: {}x{} @{} {:?} {:?} {} kbit/s, {:?}",
             cfg.width,
             cfg.height,
             cfg.fps,
             cfg.codec,
+            cfg.profile,
             cfg.bitrate_kbps,
             cap.mode()
         );
@@ -249,6 +246,11 @@ impl VideoSource for HeadsetSource {
         self.keyframe_requested = true;
     }
 
+    fn set_bitrate(&mut self, kbps: u32) -> Result<()> {
+        let r = self.run.as_mut().context("source not started")?;
+        r.enc.set_bitrate(kbps)
+    }
+
     fn stop(&mut self) {
         if let Some(r) = self.run.take() {
             info!("headset source stopped after {} frames", r.frame_index);
@@ -276,6 +278,7 @@ fn finish(r: &mut Running, stats: &mut FrameStats, p: fl_encode::Packet) -> Enco
     let frame = EncodedFrame {
         data: p.data,
         keyframe: p.keyframe,
+        captured: r.start + Duration::from_micros(p.pts_us),
         pts_us: p.pts_us,
         frame_index: r.frame_index,
     };

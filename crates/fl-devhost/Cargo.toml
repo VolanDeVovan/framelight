@@ -3,7 +3,7 @@ name = "fl-devhost"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Dev binary: GameStream host with a synthetic ffmpeg test-pattern source"
+description = "Dev binary: the WebRTC streamer with an ffmpeg test-pattern source"
 publish = false
 
 [dependencies]
@@ -12,6 +12,6 @@ bytes.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 fl-core.workspace = true
-fl-gamestream = { path = "../fl-gamestream" }
+fl-webrtc = { path = "../fl-webrtc" }
 fl-audio = { path = "../fl-audio" }
 libc = "0.2"

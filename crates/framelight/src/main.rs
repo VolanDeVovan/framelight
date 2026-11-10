@@ -1,27 +1,34 @@
-//! framelight: stream the Steam Frame's Headset View to Moonlight clients.
+//! framelight: show what the Steam Frame shows, in any browser on the network.
 //!
-//!   framelight serve [--name NAME] [--state DIR] [--pin NNNN] [--no-hevc]
-//!                    [--intra-refresh N] [--test-pattern] [--synthetic] [--zero-copy]
-//!                    [--audio monitor|silence] [--nice N]
-//!       Moonlight-compatible host for the Headset View. Without --pin, type the PIN a
-//!       pairing client shows into stdin (a fixed --pin lets any device on the network
-//!       pair). --audio monitor (default) streams what the device plays (default sink
-//!       monitor, Opus); silence sends empty Opus frames. --nice (default 10) keeps the
-//!       process below the game for CPU time.
+//!   framelight app [serve options]
+//!       The switch, as a small window to open on the headset: Enable / Disable and
+//!       the address to type into a browser. Streaming lives exactly as long as it is
+//!       enabled in this window. `pkill -USR1 -x framelight` presses the button
+//!       from a shell.
+//!   framelight serve [--port N] [--width W --height H --fps F] [--bitrate-kbps B]
+//!                    [--audio monitor|off] [--nice N]
+//!                    [--test-pattern] [--synthetic] [--zero-copy] [--gop N]
+//!                    [--intra-refresh N] [--device /dev/videoN]
+//!       The same streamer without a window (over ssh, for tests): enabled until it
+//!       is stopped. --audio monitor (default) streams what the device plays.
+//!       --nice (default 10) keeps the process below the game for CPU time.
 //! Diagnostics:
-//!   framelight probe --seconds N --codec hevc|h264 --width W --height H
-//!                    --fps F --bitrate-kbps B --out FILE
-//!                    [--zero-copy] [--gop N] [--intra-refresh N]
+//!   framelight probe --seconds N --codec h264|hevc --profile high|main|baseline
+//!                    --width W --height H --fps F --bitrate-kbps B --out FILE
+//!                    [--bitrate-step KBPS] [--zero-copy] [--gop N] [--intra-refresh N]
 //!                    [--keyframe-every SECS] [--quiet]
 //!                    [--synthetic] [--device /dev/videoN] [--coded FOURCC]
+//!       Encodes to a file and reports timings. --bitrate-step switches to that
+//!       bitrate halfway and reports the rate of each half.
 //!   framelight vrtimings --seconds N     (compositor timing baseline)
 //!   framelight selftest [--device /dev/videoN] [--coded FWHT|H264|HEVC]
 //!                       [--width W --height H --frames N --out FILE] [--zero-copy]
-//!       Synthetic picture -> GPU NV12 -> encoder input (dmabuf), checks the
-//!       bytes in every input buffer against a CPU reference, then runs the
-//!       stateful encode flow: keyframe request, drain, restart, drain.
+//!       Synthetic picture -> GPU NV12 -> encoder input, checks the bytes in every
+//!       input buffer against a CPU reference, then runs the stateful encode flow:
+//!       keyframe request, drain, restart, drain.
 
 mod source;
+mod ui;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -32,7 +39,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use fl_capture::openvr::{FrameTiming, OpenVr};
 use fl_capture::{HeadsetCapture, SyntheticProvider, TargetLayout, TargetMode};
-use fl_core::{Codec, StreamConfig, VideoSource};
+use fl_core::{Codec, H264Profile, StreamConfig, VideoSource};
 use fl_encode::{Encoder, EncoderConfig};
 use source::{HeadsetSource, SourceOptions};
 use tracing::info;
@@ -46,12 +53,13 @@ fn main() -> Result<()> {
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("app") => app(&args[1..]),
         Some("serve") => serve(&args[1..]),
         Some("probe") => probe(&args[1..]),
         Some("vrtimings") => vrtimings(&args[1..]),
         Some("selftest") => selftest(&args[1..]),
         _ => {
-            eprintln!("usage: framelight serve|probe|vrtimings|selftest [options] (see source header)");
+            eprintln!("usage: framelight app|serve|probe|vrtimings|selftest [options] (see source header)");
             std::process::exit(2);
         }
     }
@@ -202,7 +210,7 @@ fn vrtimings(a: &[String]) -> Result<()> {
 fn probe(a: &[String]) -> Result<()> {
     let args = Args::parse(a, &["zero-copy", "quiet", "test-pattern", "synthetic"])?;
     let secs: f64 = args.get("seconds", 5.0)?;
-    let codec = match args.get("codec", "hevc".to_string())?.as_str() {
+    let codec = match args.get("codec", "h264".to_string())?.as_str() {
         "hevc" | "h265" => Codec::Hevc,
         "h264" | "avc" => Codec::H264,
         c => bail!("unknown codec {c}"),
@@ -213,8 +221,15 @@ fn probe(a: &[String]) -> Result<()> {
         fps: args.get("fps", 60)?,
         bitrate_kbps: args.get("bitrate-kbps", 20000)?,
         codec,
+        profile: match args.get("profile", "high".to_string())?.as_str() {
+            "high" => H264Profile::High,
+            "main" => H264Profile::Main,
+            "baseline" => H264Profile::ConstrainedBaseline,
+            p => bail!("unknown profile {p}"),
+        },
     };
-    let out: String = args.get("out", "probe.hevc".to_string())?;
+    let bitrate_step: u32 = args.get("bitrate-step", 0)?;
+    let out: String = args.get("out", "probe.h264".to_string())?;
     let kf_every: f64 = args.get("keyframe-every", 0.0)?;
     let quiet = args.flag("quiet");
     let opts = SourceOptions {
@@ -246,12 +261,18 @@ fn probe(a: &[String]) -> Result<()> {
     let mut last_sample = t0;
     let mut last_kf_req = t0;
     let (mut frames, mut keyframes, mut bytes, mut empty) = (0u64, 0u64, 0u64, 0u64);
+    // (when the bitrate was switched, bytes before, keyframes before).
+    let mut stepped: Option<(f64, u64, u64)> = None;
     let (mut enc_ms, mut gpu_ms, mut copy_ms) = (Vec::new(), Vec::new(), Vec::new());
     let mut kf_sizes = Vec::new();
     while t0.elapsed().as_secs_f64() < secs {
         if kf_every > 0.0 && last_kf_req.elapsed().as_secs_f64() >= kf_every {
             last_kf_req = Instant::now();
             src.request_keyframe();
+        }
+        if bitrate_step > 0 && stepped.is_none() && t0.elapsed().as_secs_f64() >= secs / 2.0 {
+            src.set_bitrate(bitrate_step)?;
+            stepped = Some((t0.elapsed().as_secs_f64(), bytes, keyframes));
         }
         let f = src.next_frame()?;
         let st = src.last_stats;
@@ -318,6 +339,15 @@ fn probe(a: &[String]) -> Result<()> {
         bytes,
         out
     );
+    if let Some((at, bytes_before, keys_before)) = stepped {
+        info!(
+            "summary: bitrate step at {at:.1}s: {:.0} kbit/s before ({} asked), {:.0} kbit/s after ({bitrate_step} asked), {} keyframes after the step",
+            bytes_before as f64 * 8.0 / at / 1000.0,
+            cfg.bitrate_kbps,
+            (bytes - bytes_before) as f64 * 8.0 / (wall - at) / 1000.0,
+            keyframes - keys_before
+        );
+    }
     info!(
         "summary: encode latency mean {:.2} p50 {:.2} p95 {:.2} max {:.2} ms",
         mean(&enc_ms),
@@ -434,7 +464,7 @@ fn selftest(a: &[String]) -> Result<()> {
     let height: u32 = args.get("height", 360)?;
     let frames: u32 = args.get("frames", 30)?;
     let fps: u32 = 30;
-    let coded: String = args.get("coded", "HEVC".to_string())?;
+    let coded: String = args.get("coded", "H264".to_string())?;
     let out: String = args.get("out", "selftest.bin".to_string())?;
     let mut ec = EncoderConfig::new(
         width,
@@ -653,79 +683,101 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-fn serve(a: &[String]) -> Result<()> {
-    use std::sync::atomic::Ordering;
-    use std::sync::mpsc;
+/// Set by SIGUSR1: press the app's button.
+static TOGGLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    let args = Args::parse(a, &["no-hevc", "zero-copy", "test-pattern", "synthetic", "no-mdns"])?;
-    let host_name = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "frame".into());
-    let state = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join(".local/state/framelight");
-    let mut cfg = fl_gamestream::HostConfig::new(
-        args.get("name", host_name)?,
-        args.get("state", state.display().to_string())?,
-    );
-    cfg.app_name = "Headset View".into();
-    cfg.pin = args.0.get("pin").cloned();
-    cfg.hevc = !args.flag("no-hevc");
-    cfg.mdns = !args.flag("no-mdns");
-    let opts = SourceOptions {
-        zero_copy: args.flag("zero-copy"),
-        gop: args.get("gop", 0)?,
-        intra_refresh: args.get("intra-refresh", 0)?,
-        test_pattern: args.flag("test-pattern"),
-        synthetic: args.flag("synthetic"),
-        device: args.0.get("device").cloned(),
-        coded_format: None,
-    };
-    let audio: Box<dyn fl_core::AudioSource> = match args.get("audio", "monitor".to_string())?.as_str() {
-        "monitor" => Box::new(fl_audio::MonitorAudioSource::new()),
-        "silence" => Box::new(fl_gamestream::SilenceAudioSource::new()),
-        other => bail!("--audio {other}: expected monitor or silence"),
-    };
-    let nice: i32 = args.get("nice", 10)?;
-    // SAFETY: plain syscall. Threads started from here on inherit the value.
-    if nice != 0 && unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) } != 0 {
-        tracing::warn!("setpriority({nice}): {}", std::io::Error::last_os_error());
+extern "C" fn on_toggle(_: libc::c_int) {
+    TOGGLE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+const SERVE_FLAGS: [&str; 3] = ["zero-copy", "test-pattern", "synthetic"];
+
+/// Everything `serve` and `app` need to start the streamer, any number of times.
+struct Streamer {
+    cfg: fl_webrtc::ServerConfig,
+    opts: SourceOptions,
+    audio: bool,
+}
+
+impl Streamer {
+    fn from_args(args: &Args) -> Result<Self> {
+        let d = fl_webrtc::ServerConfig::default();
+        let cfg = fl_webrtc::ServerConfig {
+            port: args.get("port", d.port)?,
+            width: args.get("width", d.width)?,
+            height: args.get("height", d.height)?,
+            fps: args.get("fps", d.fps)?,
+            bitrate_kbps: args.get("bitrate-kbps", d.bitrate_kbps)?,
+            title: d.title,
+        };
+        let opts = SourceOptions {
+            zero_copy: args.flag("zero-copy"),
+            gop: args.get("gop", 0)?,
+            intra_refresh: args.get("intra-refresh", 0)?,
+            test_pattern: args.flag("test-pattern"),
+            synthetic: args.flag("synthetic"),
+            device: args.0.get("device").cloned(),
+            coded_format: None,
+        };
+        let audio = match args.get("audio", "monitor".to_string())?.as_str() {
+            "monitor" => true,
+            "off" => false,
+            other => bail!("--audio {other}: expected monitor or off"),
+        };
+        let nice: i32 = args.get("nice", 10)?;
+        // SAFETY: plain syscall. Threads started from here on inherit the value.
+        if nice != 0 && unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) } != 0 {
+            tracing::warn!("setpriority({nice}): {}", std::io::Error::last_os_error());
+        }
+        Ok(Self { cfg, opts, audio })
     }
-    let host = fl_gamestream::GameStreamHost::start(cfg, Box::new(HeadsetSource::new(opts)), audio)?;
+
+    fn start(&self) -> Result<fl_webrtc::Server> {
+        let audio: Option<Box<dyn fl_core::AudioSource>> =
+            self.audio.then(|| Box::new(fl_audio::MonitorAudioSource::new()) as _);
+        fl_webrtc::Server::start(self.cfg.clone(), Box::new(HeadsetSource::new(self.opts.clone())), audio)
+    }
+
+    /// The addresses to type into a browser: by name (avahi announces `<hostname>.local`)
+    /// and by number.
+    fn urls(&self) -> Vec<String> {
+        let port = self.cfg.port;
+        let mut urls = Vec::new();
+        if let Ok(name) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+            urls.push(format!("http://{}.local:{port}", name.trim()));
+        }
+        if let Some(ip) = fl_webrtc::primary_ipv4() {
+            urls.push(format!("http://{ip}:{port}"));
+        }
+        urls
+    }
+}
+
+fn install_signal_handlers() {
     // SAFETY: the handler only stores to an atomic.
     unsafe {
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
     }
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        while std::io::stdin().read_line(&mut line).is_ok_and(|n| n > 0) {
-            let _ = tx.send(line.trim().to_string());
-            line.clear();
-        }
-    });
-    let mut announced = false;
-    while !STOP.load(Ordering::SeqCst) {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(pin) if !pin.is_empty() => {
-                if host.submit_pin(&pin) {
-                    info!("PIN submitted");
-                } else {
-                    tracing::warn!("no pairing is waiting for a PIN");
-                }
-            }
-            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(Duration::from_millis(200)),
-        }
-        let waiting = host.pairing_waits_for_pin();
-        if waiting && !announced {
-            info!("a client is pairing: type the PIN it shows and press Enter");
-        }
-        announced = waiting;
+}
+
+fn serve(a: &[String]) -> Result<()> {
+    let streamer = Streamer::from_args(&Args::parse(a, &SERVE_FLAGS)?)?;
+    let server = streamer.start()?;
+    info!("watch at {}", streamer.urls().join(" or "));
+    install_signal_handlers();
+    while !STOP.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(200));
     }
     info!("shutting down");
-    host.shutdown();
+    server.shutdown();
     Ok(())
+}
+
+fn app(a: &[String]) -> Result<()> {
+    let streamer = Streamer::from_args(&Args::parse(a, &SERVE_FLAGS)?)?;
+    install_signal_handlers();
+    // SAFETY: the handler only stores to an atomic.
+    unsafe { libc::signal(libc::SIGUSR1, on_toggle as *const () as libc::sighandler_t) };
+    ui::run(&streamer, &STOP, &TOGGLE)
 }
