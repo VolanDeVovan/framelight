@@ -4,7 +4,6 @@
 { pkgs, lib, modulesPath, ... }:
 {
   imports = [ "${modulesPath}/virtualisation/qemu-vm.nix" ];
-  # Built by run-vm.sh; runs /mnt/share/run.sh at boot, then powers off.
   system.stateVersion = "25.11";
   boot.kernelPackages = pkgs.linuxPackages_latest;
   boot.kernelModules = [ "vicodec" ];

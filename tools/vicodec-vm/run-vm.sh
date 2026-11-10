@@ -16,4 +16,6 @@ SHARE_DIR=$share nix build --impure -o "$share/vm" --expr "
   }).config.system.build.vm"
 (cd "$share" && timeout 600 ./vm/bin/run-nixos-vm >"$share/console.log" 2>&1)
 sed 's/\x1b\[[0-9;]*m//g' "$share/result.log"
-! grep -q "selftest: FAIL" "$share/result.log"
+# Both self-tests must pass and the probe must have got through to its summary.
+[ "$(grep -c "selftest: PASS" "$share/result.log")" = 2 ]
+grep -q "summary: .* frames in" "$share/result.log"
