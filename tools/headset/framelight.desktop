@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=framelight
+Comment=Stream the Headset View to browsers on the LAN
+Exec=/home/steamos/framelight/framelight-app.sh
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Video;

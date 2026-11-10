@@ -1,6 +1,6 @@
 //! The switch: a window with one button, to be opened on the headset.
 //!
-//! SteamOS shows a non-Steam "game" that opens an X11 window as a flat screen inside
+//! SteamOS opens an app from its menu (a desktop entry) as an X11 window shown flat inside
 //! VR, with the controller as the pointer, so that is all this is: plain X11 over the
 //! wire protocol (no toolkit, no library on the device), a CPU-drawn picture pushed
 //! with PutImage when something changes, and a blocking wait in between. While

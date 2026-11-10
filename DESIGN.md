@@ -120,9 +120,10 @@ form).
 
 Why a plain 2D window and not a SteamVR dashboard overlay: SteamOS on the Frame runs
 every flat application as a gamescope window shown as a screen in VR with the
-controller as pointer (Telegram runs there that way), and a non-Steam shortcut is the
-one launch path that needs no SteamVR application manifest, no autostart entry and no
-system change. An overlay would have to be registered with SteamVR and kept running to
+controller as pointer (Telegram runs there that way), and Steam lists every desktop
+entry in the user's application menu, so a `.desktop` file in the home directory is the
+one launch path that needs no SteamVR application manifest, no Steam shortcut, no
+autostart entry and no system change. An overlay would have to be registered with SteamVR and kept running to
 be reachable.
 
 The window is X11 spoken directly over the socket (`x11rb` without libxcb), an 8x8
@@ -209,10 +210,9 @@ Deploy by `scp` into `/home/steamos/framelight/` (never overwrite a running bina
 place: copy to `.new` and `mv`), together with `tools/headset/framelight-app.sh`. No
 sudo, no system changes, no `systemctl enable`.
 
-To get the switch into the headset, add the wrapper to Steam once as a non-Steam game:
-on the headset, `steamos-add-to-steam /home/steamos/framelight/framelight-app.sh` (or
-Steam's "Add a Non-Steam Game" in desktop mode), then open "framelight-app.sh" from the
-library. Its log is `/home/steamos/framelight/app.log`.
+To get the switch into the headset's app list, copy `tools/headset/framelight.desktop`
+to `~/.local/share/applications/` on the headset; Steam shows it next to Firefox and
+Telegram as "framelight". Its log is `/home/steamos/framelight/app.log`.
 
 ## Workspace layout
 
