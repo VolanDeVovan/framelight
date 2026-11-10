@@ -26,20 +26,29 @@ const RATE: u32 = 48_000;
 const CHANNELS: usize = 2;
 /// How long to wait for captured data past a packet's due time before sending silence.
 /// Covers PipeWire delivering in bursts of one graph quantum (up to 1024 frames at 48 kHz).
-pub const STALL_SLACK: Duration = Duration::from_millis(40);
+const STALL_SLACK: Duration = Duration::from_millis(40);
 /// Ring capacity: one large quantum plus slack; older samples are dropped beyond it.
 const RING_MS: u32 = 60;
 /// Behind by more than this (suspend, debugger): resync instead of bursting silence.
 const RESYNC: Duration = Duration::from_millis(200);
 
 /// Opus packet duration: what browsers expect by default (`ptime` 20).
-pub const PACKET_MS: u32 = 20;
+const PACKET_MS: u32 = 20;
 
+/// Opus bitrate (CBR), bits per second, and encoder complexity (0..=10).
+const OPUS_BITRATE: u32 = 96_000;
+const OPUS_COMPLEXITY: u32 = 5;
+
+/// Samples (interleaved) and duration of one packet.
+const PACKET_SAMPLES: usize = (RATE * PACKET_MS / 1000) as usize * CHANNELS;
+const PACKET: Duration = Duration::from_millis(PACKET_MS as u64);
+
+fn new_encoder() -> Result<opus::Encoder> {
+    opus::Encoder::new(RATE, CHANNELS as u32, OPUS_BITRATE, OPUS_COMPLEXITY)
+}
+
+#[derive(Default)]
 pub struct MonitorAudioSource {
-    /// Opus bitrate (CBR), bits per second.
-    pub bitrate: u32,
-    /// Opus encoder complexity, 0..=10.
-    pub complexity: u32,
     /// libpulse, loaded on the first start; `None` if it is not available.
     pulse: Option<Arc<pulse::Pulse>>,
     run: Option<Running>,
@@ -60,20 +69,9 @@ struct Running {
     silent: bool,
 }
 
-impl Default for MonitorAudioSource {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl MonitorAudioSource {
     pub fn new() -> Self {
-        Self {
-            bitrate: 96_000,
-            complexity: 5,
-            pulse: None,
-            run: None,
-        }
+        Self::default()
     }
 }
 
@@ -89,10 +87,10 @@ impl AudioSource for MonitorAudioSource {
                 }
             }
         }
-        let frame = (RATE * PACKET_MS / 1000) as usize * CHANNELS;
+        let frame = PACKET_SAMPLES;
         let cap = (RATE * RING_MS / 1000) as usize * CHANNELS;
         let shared = Arc::new(pulse::Shared::new(cap, frame));
-        let enc = opus::Encoder::new(RATE, CHANNELS as u32, self.bitrate, self.complexity)?;
+        let enc = new_encoder()?;
         let frag_bytes = (frame * 2) as u32;
         let thread = match self.pulse.clone() {
             Some(pa) => {
@@ -108,7 +106,7 @@ impl AudioSource for MonitorAudioSource {
         };
         tracing::info!(
             packet_ms = PACKET_MS,
-            bitrate = self.bitrate,
+            bitrate = OPUS_BITRATE,
             "audio: monitor source started"
         );
         self.run = Some(Running {
@@ -116,7 +114,7 @@ impl AudioSource for MonitorAudioSource {
             thread,
             enc,
             frame,
-            packet: Duration::from_millis(PACKET_MS as u64),
+            packet: PACKET,
             pcm: vec![0; frame],
             out: vec![0; 1500],
             base: Instant::now(),

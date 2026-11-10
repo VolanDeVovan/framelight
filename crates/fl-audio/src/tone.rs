@@ -2,15 +2,15 @@
 //! source, paced by the clock. For end-to-end tests of the audio path that must not
 //! touch (or depend on) the machine's sound devices.
 
-use crate::{CHANNELS, PACKET_MS, RATE, opus};
+use crate::{CHANNELS, PACKET, PACKET_SAMPLES, RATE, new_encoder, opus};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use fl_core::{AudioPacket, AudioSource};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 pub struct ToneAudioSource {
     /// Left channel frequency; the right channel plays an octave above.
-    pub hz: f32,
+    hz: f32,
     run: Option<Running>,
 }
 
@@ -30,10 +30,9 @@ impl ToneAudioSource {
 
 impl AudioSource for ToneAudioSource {
     fn start(&mut self) -> Result<()> {
-        let frame = (RATE * PACKET_MS / 1000) as usize * CHANNELS;
         self.run = Some(Running {
-            enc: opus::Encoder::new(RATE, CHANNELS as u32, 96_000, 5)?,
-            pcm: vec![0; frame],
+            enc: new_encoder()?,
+            pcm: vec![0; PACKET_SAMPLES],
             out: vec![0; 1500],
             start: Instant::now(),
             emitted: 0,
@@ -42,7 +41,7 @@ impl AudioSource for ToneAudioSource {
     }
 
     fn next_packet(&mut self) -> Result<AudioPacket> {
-        let (hz, packet) = (self.hz, Duration::from_millis(PACKET_MS as u64));
+        let (hz, packet) = (self.hz, PACKET);
         let r = self.run.as_mut().context("audio source not started")?;
         let due = r.start + packet * r.emitted as u32;
         if let Some(wait) = due.checked_duration_since(Instant::now()) {
