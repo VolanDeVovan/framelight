@@ -154,7 +154,7 @@ impl Shared {
         match bytes {
             Some(b) => r
                 .buf
-                .extend(b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]))),
+                .extend(b.as_chunks::<2>().0.iter().map(|&c| i16::from_le_bytes(c))),
             // A hole in the stream: fill with silence.
             None => r.buf.extend(std::iter::repeat_n(0, len / 2)),
         }

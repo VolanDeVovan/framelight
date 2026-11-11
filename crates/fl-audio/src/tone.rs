@@ -48,7 +48,7 @@ impl AudioSource for ToneAudioSource {
             std::thread::sleep(wait);
         }
         let per_packet = (r.pcm.len() / CHANNELS) as u64;
-        for (i, s) in r.pcm.chunks_exact_mut(CHANNELS).enumerate() {
+        for (i, s) in r.pcm.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
             let t = (r.emitted * per_packet + i as u64) as f32 / RATE as f32;
             let w = std::f32::consts::TAU * hz * t;
             s[0] = (w.sin() * 8000.0) as i16;
