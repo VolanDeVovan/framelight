@@ -925,7 +925,7 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "fl-audio"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "fl-capture"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "fl-core"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "fl-devhost"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "fl-encode"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "fl-webrtc"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1052,7 +1052,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "framelight"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "eframe",
