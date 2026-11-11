@@ -31,6 +31,8 @@ framelight: stream the Steam Frame's Headset View to browsers on the network
       --no-audio         video only
       --synthetic        a moving test picture instead of SteamVR
 
+  framelight version
+
 Diagnostics:
   framelight probe [--seconds N] [--out FILE] [--profile high|main|baseline]
                    [--width W --height H --fps F] [--bitrate-kbps B]
@@ -67,13 +69,17 @@ fn main() -> Result<()> {
             let streamer = Streamer::from_args(rest)?;
             lower_priority();
             if command == "app" {
-                ui::run(&streamer, &signals)
+                ui::run(&streamer, signals)
             } else {
                 serve(&streamer, &signals)
             }
         }
         "probe" => probe::run(rest),
         "selftest" => selftest::run(rest),
+        "version" | "--version" => {
+            println!("framelight {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
@@ -133,24 +139,51 @@ impl Streamer {
         Server::start(self.cfg.clone(), Box::new(video), audio)
     }
 
-    /// The addresses to type into a browser: by name (avahi announces `<hostname>.local`)
-    /// and by number.
-    pub fn urls(&self) -> Vec<String> {
+    /// The addresses to type into a browser: the default route's address and the name
+    /// avahi announces (`<hostname>.local`) in large, any other interface's address
+    /// underneath.
+    pub fn urls(&self) -> Urls {
         let port = self.cfg.port;
-        let mut urls = Vec::new();
+        let mut ips = fl_webrtc::local_ipv4_addresses().into_iter();
+        let mut urls = Urls::default();
+        if let Some(first) = ips.next() {
+            urls.main.push(format!("http://{}:{port}", first.ip));
+        }
         if let Ok(name) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
-            urls.push(format!("http://{}.local:{port}", name.trim()));
+            urls.main
+                .push(format!("http://{}.local:{port}", name.trim()));
         }
-        if let Some(ip) = fl_webrtc::primary_ipv4() {
-            urls.push(format!("http://{ip}:{port}"));
-        }
+        urls.also = ips
+            .map(|a| format!("http://{}:{port} ({})", a.ip, a.interface))
+            .collect();
         urls
+    }
+}
+
+/// Where the streamer can be reached, for people to type.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Urls {
+    /// The ones to try first.
+    pub main: Vec<String>,
+    /// Other interfaces' addresses, with the interface's name.
+    pub also: Vec<String>,
+}
+
+impl std::fmt::Display for Urls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let all: Vec<&str> = self
+            .main
+            .iter()
+            .chain(&self.also)
+            .map(String::as_str)
+            .collect();
+        f.write_str(&all.join(" or "))
     }
 }
 
 fn serve(streamer: &Streamer, signals: &Signals) -> Result<()> {
     let server = streamer.start()?;
-    info!("watch at {}", streamer.urls().join(" or "));
+    info!("watch at {}", streamer.urls());
     signals.wait_for_stop();
     info!("shutting down");
     server.shutdown();

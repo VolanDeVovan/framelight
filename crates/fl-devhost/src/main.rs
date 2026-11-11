@@ -6,8 +6,8 @@
 //! fl-devhost [--port N] [--width W --height H --fps F] [--bitrate-kbps B]
 //!            [--audio monitor|tone|off]
 //! ```
-//! Then open `http://<this machine's LAN address>:8090/` in a browser. On NixOS the
-//! monitor source needs `LD_LIBRARY_PATH` to point at libpulseaudio's `lib` directory.
+//! Then open `http://<this machine's LAN address>:8090/` in a browser. libpulse is
+//! dlopen'd; on Nix, `nix develop` puts it on `LD_LIBRARY_PATH`.
 
 mod ffmpeg;
 

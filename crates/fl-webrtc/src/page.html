@@ -5,52 +5,85 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>{{TITLE}}</title>
 <style>
-  :root { color-scheme: dark; --ink: #f2f0ea; --dim: #a9a69c; --panel: rgba(18, 18, 20, .78); --accent: #ffb454; }
+  :root { color-scheme: dark; --bg: #101114; --ink: #f2f0ea; --dim: #a9a69c; --accent: #ffb454;
+    /* Everything below is in rem: 16px on a phone, about 19px on a laptop, 25px on a 1080p TV. */
+    font-size: clamp(16px, 1.3vw, 28px); }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; background: #000; color: var(--ink);
-    font: 15px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+    font: 1rem/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  html.idle { cursor: none; }
   video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+
+  /* The state note dims whatever frame is frozen behind it, so it reads on any picture. */
   #note { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 10px; text-align: center; padding: 24px; pointer-events: none; }
-  #note b { font-size: 22px; font-weight: 600; letter-spacing: .01em; }
-  #note span { color: var(--dim); max-width: 34em; }
-  #note.hidden { display: none; }
-  #bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px;
-    padding: 12px max(16px, env(safe-area-inset-left)) calc(12px + env(safe-area-inset-bottom));
-    background: linear-gradient(transparent, var(--panel) 45%); transition: opacity .25s; }
-  #bar.away { opacity: 0; pointer-events: none; }
-  #stats { color: var(--dim); font-variant-numeric: tabular-nums; margin-right: auto; white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-  button, select { font: inherit; color: var(--ink); background: rgba(255, 255, 255, .1); border: 1px solid rgba(255, 255, 255, .22);
-    border-radius: 8px; padding: 9px 14px; min-height: 42px; cursor: pointer; }
-  button:hover, select:hover { background: rgba(255, 255, 255, .18); }
-  button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
-  label { color: var(--dim); display: flex; align-items: center; gap: 8px; }
-  option { background: #1b1b1e; }
+    gap: .6rem; text-align: center; padding: 2rem max(1.5rem, env(safe-area-inset-right)) 2rem max(1.5rem, env(safe-area-inset-left));
+    background: rgba(16, 17, 20, .82); pointer-events: none; transition: opacity .25s; }
+  #note.hidden { opacity: 0; }
+  #note b { font-size: 1.9rem; font-weight: 600; line-height: 1.2; }
+  #note span { color: var(--dim); font-size: 1.1rem; max-width: 34em; overflow-wrap: anywhere; }
+
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; flex-wrap: wrap; align-items: center; gap: .75rem 1.25rem;
+    padding: 4rem max(1.5rem, env(safe-area-inset-right)) calc(1.25rem + env(safe-area-inset-bottom)) max(1.5rem, env(safe-area-inset-left));
+    background: linear-gradient(to top, rgba(16, 17, 20, .94), rgba(16, 17, 20, .62) 55%, transparent);
+    transition: opacity .25s; }
+  /* Hidden means out of the focus order too; visibility flips only after the fade. */
+  #bar.away { opacity: 0; visibility: hidden; transition: opacity .25s, visibility 0s .25s; }
+  #stats { flex: 1 1 0; min-width: 0; color: var(--dim); font-size: .8rem; font-variant-numeric: tabular-nums;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .quality { display: flex; align-items: center; gap: .6rem; color: var(--dim); font-size: .8rem; }
+  #rate { display: flex; gap: .3rem; }
+  #rate button { min-width: 2.75rem; padding: 0 .5rem; font-variant-numeric: tabular-nums; }
+
+  button { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; min-height: 2.75rem; padding: 0 1.1rem;
+    font: inherit; font-size: 1rem; font-weight: 500; color: var(--ink); background: rgba(44, 45, 51, .9);
+    border: .1rem solid transparent; border-radius: .6rem; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  button:hover { background: rgba(74, 75, 83, .94); }
+  button[aria-checked="true"] { color: var(--accent); border-color: var(--accent); background: rgba(56, 44, 28, .94); }
+  /* The one thing worth asking for: the page has to start muted. */
+  button.cta, button.cta:hover { color: var(--bg); background: var(--accent); }
+  /* Focus has to be findable from the couch: a filled control and a ring. */
+  button:focus-visible { color: var(--bg); background: var(--ink); border-color: transparent;
+    outline: .2rem solid var(--accent); outline-offset: .2rem; }
+  svg { width: 1.3em; height: 1.3em; flex: none; fill: none; stroke: currentColor; stroke-width: 2;
+    stroke-linecap: round; stroke-linejoin: round; }
+  #sound.cta .on, #sound:not(.cta) .off { display: none; }
+
+  @media (max-width: 40rem) {
+    #stats, .quality { flex-basis: 100%; }
+    #rate, #rate button, #sound, #full { flex: 1; }
+  }
 </style>
 </head>
 <body>
 <video id="v" autoplay playsinline muted></video>
-<div id="note"><b id="noteTitle">Connecting…</b><span id="noteText"></span></div>
+<div id="note" role="status"><b id="noteTitle">Connecting…</b><span id="noteText"></span></div>
 <div id="bar">
   <div id="stats"></div>
-  <label>Quality
-    <select id="rate" title="Upper limit for the stream's bitrate; it drops below this on a lossy network">
-      <option value="3000">3 Mbit/s</option>
-      <option value="6000">6 Mbit/s</option>
-      <option value="12000">12 Mbit/s</option>
-      <option value="20000">20 Mbit/s</option>
-      <option value="30000">30 Mbit/s</option>
-    </select>
-  </label>
-  <button id="sound" aria-pressed="false">Sound off</button>
-  <button id="full">Fullscreen</button>
+  <div class="quality" title="Upper limit for the stream's bitrate, for every viewer; it drops below this on a lossy network (↑ ↓)">
+    <span id="rateLabel">Quality</span>
+    <div id="rate" role="radiogroup" aria-labelledby="rateLabel">
+      <button role="radio" value="3000">3</button>
+      <button role="radio" value="6000">6</button>
+      <button role="radio" value="12000">12</button>
+      <button role="radio" value="20000">20</button>
+      <button role="radio" value="30000">30</button>
+    </div>
+    <span>Mbit/s</span>
+  </div>
+  <button id="sound" class="cta" title="Sound (M)">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5v5h3.5L12 18V6L7.5 9.5z" fill="currentColor"/>
+      <path class="on" d="M15.5 9a4.5 4.5 0 0 1 0 6m2.5-9a8.5 8.5 0 0 1 0 12"/><path class="off" d="m16 9.5 5 5m0-5-5 5"/></svg>
+    <span>Unmute</span>
+  </button>
+  <button id="full" title="Fullscreen (F, or double-click the picture)">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5m6 0h5v5m0 6v5h-5m-6 0H4v-5"/></svg>
+    <span>Fullscreen</span>
+  </button>
 </div>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const video = $("v"), bar = $("bar");
+const video = $("v"), bar = $("bar"), rates = $("rate"), sound = $("sound"), full = $("full");
 let pc = null, viewerId = null, generation = 0, retryTimer = null;
 let last = null, stalledFor = 0;
 // For tests and the curious: the latest numbers from getStats().
@@ -60,6 +93,7 @@ function note(title, text) {
   $("note").classList.toggle("hidden", !title);
   $("noteTitle").textContent = title || "";
   $("noteText").textContent = text || "";
+  if (title) $("stats").textContent = "";
 }
 
 function bye() {
@@ -121,12 +155,7 @@ async function showStatus() {
     // A headset that is asleep does not answer at all: do not wait for the TCP timeout.
     const signal = AbortSignal.timeout ? AbortSignal.timeout(3000) : undefined;
     const s = await (await fetch("/status", { signal })).json();
-    const rate = $("rate");
-    if (![...rate.options].some((o) => +o.value === s.ceiling_kbps)) {
-      // Started with a ceiling that is not one of the presets.
-      rate.add(new Option((s.ceiling_kbps / 1000).toFixed(1).replace(/\.0$/, "") + " Mbit/s", s.ceiling_kbps));
-    }
-    rate.value = String(s.ceiling_kbps);
+    showCeiling(s.ceiling_kbps);
     return s;
   } catch (_) { return null; }
 }
@@ -169,29 +198,100 @@ async function poll() {
   }
 }
 
-$("rate").onchange = async () => {
-  try { await fetch("/bitrate?kbps=" + $("rate").value, { method: "POST" }); } catch (_) {}
-};
-$("sound").onclick = () => {
+// The bitrate ceiling is one for everybody, since there is one encode.
+function showCeiling(kbps) {
+  let chosen = [...rates.children].find((b) => +b.value === kbps);
+  if (!chosen) {
+    // Started with a ceiling that is not one of the presets.
+    chosen = document.createElement("button");
+    chosen.setAttribute("role", "radio");
+    chosen.value = kbps;
+    chosen.textContent = (kbps / 1000).toFixed(1).replace(/\.0$/, "");
+    rates.insertBefore(chosen, [...rates.children].find((b) => +b.value > kbps) || null);
+  }
+  for (const b of rates.children) b.setAttribute("aria-checked", String(b === chosen));
+}
+async function setCeiling(kbps) {
+  showCeiling(kbps);
+  try { showCeiling((await (await fetch("/bitrate?kbps=" + kbps, { method: "POST" })).json()).ceiling_kbps); } catch (_) {}
+}
+function stepCeiling(by) {
+  const all = [...rates.children];
+  const next = all[all.findIndex((b) => b.getAttribute("aria-checked") === "true") + by];
+  if (next) setCeiling(+next.value);
+}
+rates.onclick = (e) => { const b = e.target.closest("button"); if (b) setCeiling(+b.value); };
+
+// Browsers only let a page make sound after a gesture, so it starts muted and asks.
+function toggleSound() {
   video.muted = !video.muted;
-  $("sound").textContent = video.muted ? "Sound off" : "Sound on";
-  $("sound").setAttribute("aria-pressed", String(!video.muted));
   video.play().catch(() => {});
+}
+video.onvolumechange = () => {
+  sound.classList.toggle("cta", video.muted);
+  sound.lastElementChild.textContent = video.muted ? "Unmute" : "Mute";
 };
-$("full").onclick = () => {
+sound.onclick = toggleSound;
+
+function toggleFullscreen() {
   const el = document.documentElement;
   if (document.fullscreenElement) document.exitFullscreen();
   else if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
   else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
+}
+document.onfullscreenchange = () => {
+  full.lastElementChild.textContent = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen";
 };
+full.onclick = video.ondblclick = toggleFullscreen;
 
-let hideTimer = null;
+// The bar: any input shows it and puts the focus in it, so that a remote's arrows and OK
+// work at once; it leaves after a few idle seconds or on Back.
+let hideTimer = null, focused = sound, pointer = "";
 function wake() {
   bar.classList.remove("away");
+  document.documentElement.classList.remove("idle");
+  if (!bar.contains(document.activeElement)) focused.focus();
   clearTimeout(hideTimer);
-  hideTimer = setTimeout(() => { if (!bar.contains(document.activeElement) || document.activeElement === document.body) bar.classList.add("away"); }, 4000);
+  hideTimer = setTimeout(hide, 5000);
 }
-["pointermove", "pointerdown", "keydown", "touchstart"].forEach((e) => addEventListener(e, wake, { passive: true }));
+function hide() {
+  clearTimeout(hideTimer);
+  bar.classList.add("away");
+  document.documentElement.classList.add("idle");
+  document.activeElement.blur();
+}
+bar.addEventListener("focusin", (e) => { focused = e.target; });
+addEventListener("pointerdown", wake);
+addEventListener("pointermove", (e) => {
+  // Browsers also report a "move" when the page changes under a pointer that is at rest.
+  const at = e.screenX + "," + e.screenY;
+  if (at !== pointer) { pointer = at; wake(); }
+});
+addEventListener("keydown", (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const away = bar.classList.contains("away");
+  // 461 is Back on an LG remote. With the bar away it keeps its usual meaning.
+  if (e.keyCode === 461 || e.key === "Escape" || e.key === "Backspace") {
+    if (!away) { e.preventDefault(); hide(); }
+    return;
+  }
+  const key = e.key.toLowerCase();
+  if (key === "f") toggleFullscreen();
+  else if (key === "m") toggleSound();
+  else if (away) {
+    // The key that brings the bar back does nothing else: OK must not also press a button.
+    if (key === "enter" || key === " " || key.startsWith("arrow")) e.preventDefault();
+  } else if (key === "arrowup" || key === "arrowdown") {
+    e.preventDefault();
+    stepCeiling(key === "arrowup" ? 1 : -1);
+  } else if (key === "arrowleft" || key === "arrowright") {
+    e.preventDefault();
+    const all = [...bar.querySelectorAll("button")];
+    const next = all[all.indexOf(document.activeElement) + (key === "arrowleft" ? -1 : 1)];
+    if (next) next.focus();
+  }
+  wake();
+});
 addEventListener("pagehide", () => { bye(); });
 addEventListener("pageshow", (e) => { if (e.persisted) connect(); });
 

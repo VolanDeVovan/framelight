@@ -229,12 +229,117 @@ impl Drop for Server {
 }
 
 /// The IPv4 address this machine uses towards the LAN (the source address of its
-/// default route), for showing a URL to type. No packet is sent.
+/// default route). No packet is sent.
 pub fn primary_ipv4() -> Option<Ipv4Addr> {
     let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     s.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
     match s.local_addr().ok()?.ip() {
         IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
         _ => None,
+    }
+}
+
+/// An address the streamer can be reached at, and the interface that has it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalAddress {
+    pub interface: String,
+    pub ip: Ipv4Addr,
+}
+
+/// Every IPv4 address a browser elsewhere could reach this machine at: on interfaces
+/// that are up and running, not loopback, not link-local. The streamer listens on all
+/// of them. The default route's address comes first.
+pub fn local_ipv4_addresses() -> Vec<LocalAddress> {
+    let mut found = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates the list; every entry is read before freeifaddrs.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return found;
+    }
+    let wanted = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_uint;
+    let mut entry = list;
+    while !entry.is_null() {
+        // SAFETY: a non-null entry of the list getifaddrs returned.
+        let ifa = unsafe { &*entry };
+        entry = ifa.ifa_next;
+        if ifa.ifa_addr.is_null()
+            || ifa.ifa_flags & wanted != wanted
+            || ifa.ifa_flags & libc::IFF_LOOPBACK as libc::c_uint != 0
+            // SAFETY: ifa_addr is non-null and starts with the family.
+            || i32::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET
+        {
+            continue;
+        }
+        // SAFETY: an AF_INET address is a sockaddr_in; the name is a C string.
+        let (sin, name) = unsafe {
+            (
+                &*ifa.ifa_addr.cast::<libc::sockaddr_in>(),
+                std::ffi::CStr::from_ptr(ifa.ifa_name),
+            )
+        };
+        found.push(LocalAddress {
+            interface: name.to_string_lossy().into_owned(),
+            ip: Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)),
+        });
+    }
+    // SAFETY: the list from getifaddrs above, no longer referenced.
+    unsafe { libc::freeifaddrs(list) };
+    reachable_first(found, primary_ipv4())
+}
+
+/// Drops what no other machine can use and puts the default route's address first.
+fn reachable_first(mut found: Vec<LocalAddress>, primary: Option<Ipv4Addr>) -> Vec<LocalAddress> {
+    found.retain(|a| !(a.ip.is_loopback() || a.ip.is_link_local() || a.ip.is_unspecified()));
+    if let Some(i) = found.iter().position(|a| Some(a.ip) == primary) {
+        let first = found.remove(i);
+        found.insert(0, first);
+    }
+    found
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    fn at(interface: &str, ip: [u8; 4]) -> LocalAddress {
+        LocalAddress {
+            interface: interface.into(),
+            ip: ip.into(),
+        }
+    }
+
+    #[test]
+    fn the_default_route_first_and_nothing_unreachable() {
+        let found = vec![
+            at("tailscale0", [100, 64, 0, 7]),
+            at("lo", [127, 0, 0, 1]),
+            at("wlan0", [192, 168, 0, 48]),
+            at("usb0", [169, 254, 3, 1]),
+        ];
+        let wifi = Some(Ipv4Addr::new(192, 168, 0, 48));
+        assert_eq!(
+            reachable_first(found.clone(), wifi),
+            [
+                at("wlan0", [192, 168, 0, 48]),
+                at("tailscale0", [100, 64, 0, 7])
+            ]
+        );
+        // No default route: the interface order stays.
+        assert_eq!(
+            reachable_first(found, None),
+            [
+                at("tailscale0", [100, 64, 0, 7]),
+                at("wlan0", [192, 168, 0, 48])
+            ]
+        );
+    }
+
+    #[test]
+    fn this_machine_has_an_address() {
+        // Whatever the test machine has, the call works and keeps its promises.
+        for a in local_ipv4_addresses() {
+            assert!(!a.ip.is_loopback() && !a.ip.is_link_local(), "{a:?}");
+            assert!(!a.interface.is_empty());
+        }
     }
 }

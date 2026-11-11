@@ -110,6 +110,26 @@ page reconnects by itself when its connection fails, never gets established, or 
 picture stalls, and says so ("Cannot reach the headset" when `/status` does not answer
 either).
 
+**The page.** One picture and a bar of controls along the bottom: the quality presets,
+sound, fullscreen, and the stream's numbers in small print. It is meant to work from a
+couch as well as from a desk. Any key, pointer movement or touch shows the bar and puts
+the focus in it; it leaves after 5 idle seconds, or on Back (key code 461 on an LG
+remote), Escape or Backspace, which are left alone once it is gone. The key that brings
+the bar back does nothing else.
+
+| key               | what |
+|-------------------|------|
+| left, right       | move between the controls |
+| OK / Enter, Space | press the focused one |
+| up, down          | next / previous quality preset |
+| M                 | sound on and off |
+| F, double-click   | fullscreen |
+
+The page starts muted, because browsers let a page make sound only after a gesture;
+until then "Unmute" is the highlighted control and the one that has the focus. State
+messages dim the frozen picture behind them. Sizes follow the viewport width (16 px
+type on a phone, 25 px on a 1080p TV).
+
 **Switching off.** Disabling (or stopping `serve`) closes every connection properly
 (RTCP BYE, DTLS close_notify), so pages notice at once instead of after the browser's
 ICE timeout, and then keep retrying until streaming is enabled again.
@@ -127,8 +147,11 @@ calls (two in `poll`, a channel receive, two condition variables): no timers.
 ## The switch (`framelight app`)
 
 Streaming is enabled and disabled from a window on the headset: one button, the state,
-the viewer count and the addresses to type (`http://frame.local:8090` and the IP
-form).
+the viewer count and the addresses to type. The streamer listens on every interface,
+so every address works; the window shows the default route's address and
+`<hostname>.local` in large, and up to two more interfaces' addresses (Tailscale, for
+instance) small with the interface's name (`getifaddrs`: up and running, not loopback
+or link-local). The log lists all of them.
 
 Why a plain 2D window and not a SteamVR dashboard overlay: SteamOS on the Frame runs
 every flat application as a gamescope window shown as a screen in VR with the
@@ -138,18 +161,44 @@ one launch path that needs no SteamVR application manifest, no Steam shortcut, n
 autostart entry and no system change. An overlay would have to be registered with SteamVR and kept running to
 be reachable.
 
-The window is X11 spoken directly over the socket (`x11rb` without libxcb), an 8x8
-bitmap font compiled in, and a CPU-drawn picture pushed with PutImage only when
-something changes. So the binary still links nothing but libc/libm. While streaming is
-disabled the process is one thread asleep in `poll` on the X socket and a signalfd.
-The streamer lives inside this process: closing the app ends streaming. While
-streaming is enabled the window wakes once a second to refresh the viewer count.
+The window is eframe/egui drawing with OpenGL (the `glow` backend, no wgpu) on X11,
+which is all gamescope gives its clients; Wayland support is not compiled in. winit and
+glutin `dlopen` what they need (libX11, libX11-xcb, libxcb, libXcursor, libXi,
+libXrender, libxkbcommon, libxkbcommon-x11, and libGL or libEGL: GLX is tried first),
+so the binary itself still links nothing but libc/libm. `WM_CLASS`, which the desktop
+entry's `StartupWMClass` names, is the name of the binary: winit takes it from there.
+
+`ui/view.rs` is the whole picture as a function of the window size, a theme and five
+values (enabled, addresses, viewers, source state, error). The blocks sit at fixed rows
+of a 90-row grid whose unit is a whole number of pixels (12 at 1080p, 8 at 720p), so
+the button is in the same place in every state, and a line that would be too wide gets
+a smaller size. The window asks for the size of the screen it opens on, and the
+display's scale factor is ignored: the layout scales with the window by itself.
+
+`ui/theme.rs` is the look as data: one font, text sizes, corner radius and ten colours.
+There are two for now, picked by the `THEME` constant, and one of them will go:
+`PIXEL` (Press Start 2P, an 8 px bitmap-style face whose sizes are kept to multiples
+of 8 px so it stays sharp; square shapes, amber on near-black) and `STEAM` (Inter, dark
+blue, light blue accent, rounded corners). Both fonts are OFL and compiled in from
+`assets/fonts`, next to their licences; only the selected one ends up in the binary.
+
+Nothing is drawn unless something happened: input, a signal, or, while streaming is
+enabled, one frame a second for the viewer count. While it is disabled the process
+does not wake up (under Xvfb with llvmpipe: no CPU time and no wake-up of the main
+thread in 10 s). The streamer lives inside this process: closing the window ends streaming.
 Input is ignored for the first 0.8 s so the click that launched the app cannot press
-the button.
+the button. Return, keypad Enter and space press it too, once per key press.
 
 `SIGUSR1` presses the button, for a shell (`pkill -USR1 -x framelight`). `SIGINT`,
-`SIGTERM` and `SIGUSR1` are blocked and read from a signalfd that is polled together
-with the X socket, so a signal cannot fall between "checked" and "asleep".
+`SIGTERM` and `SIGUSR1` are blocked before any thread starts and read from a signalfd,
+so a signal cannot fall between "checked" and "asleep". In the app a thread
+(`fl-signals`) sleeps on that descriptor, hands each signal to the window over a
+channel and asks egui for a frame; `SIGINT` and `SIGTERM` close the window.
+
+Not checked on the headset yet: that its Xwayland offers the window a working GL
+context (and which driver), what the GL context costs in memory (the old CPU-drawn
+window was 12 MB in all), and that gamescope gives the window keyboard focus, which
+winit needs before it reports keys.
 
 `framelight serve` is the same streamer without a window, enabled until it is
 stopped (asleep in `poll` on the signalfd).
@@ -162,6 +211,7 @@ framelight serve [options]     headless
     --port N  --width W --height H --fps F  --bitrate-kbps B  --no-audio  --synthetic
 framelight probe ...           capture + encode alone, to a file, with timings
 framelight selftest ...        synthetic picture -> GPU NV12 -> encoder, checked
+framelight version
 ```
 
 `framelight help` has the details. Unknown options are errors. `--synthetic` replaces
@@ -170,8 +220,8 @@ runs at nice 10, below the game.
 
 ## Threads
 
-Blocking threads, no async runtime. All of them belong to `fl_webrtc::Server`, which
-starts them in `start` and joins them when it is dropped:
+Blocking threads, no async runtime. The streamer's all belong to `fl_webrtc::Server`,
+which starts them in `start` and joins them when it is dropped:
 
 | thread | does | asleep in |
 |--------|------|-----------|
@@ -181,7 +231,9 @@ starts them in `start` and joins them when it is dropped:
 | `fl-video` | runs the video source while someone watches (capture tick + encoder poll) | a condition variable |
 | `fl-audio` | runs the audio source while someone watches | a condition variable |
 
-plus the libpulse capture thread while someone watches. The hub tells the pumps what
+plus the libpulse capture thread while someone watches, and in `framelight app` the
+window's event loop on the main thread, `fl-signals` (asleep in `poll` on the signalfd)
+and whatever threads the GL driver starts. The hub tells the pumps what
 it wants (run or not, profile, bitrate, keyframe due) through one mutex-protected
 struct; the pumps answer with messages. Stopping raises the eventfd, tells the pumps
 and sends the hub a message: no thread's exit depends on another thread.
@@ -192,7 +244,9 @@ of the encoder buffer and one into the shared `Arc`.
 ## Measured on the headset (2026-11-10, 1920x1080@60, H.264 Main)
 
 Taken before the cleanup of the same day, which did not touch the data path (capture,
-encode, packetizing) but did change what sleeps where; not measured again since.
+encode, packetizing) but did change what sleeps where; not measured again since. The
+window was the earlier CPU-drawn one: the first two rows (and the thread count and
+memory) have to be measured again with the egui window.
 
 | state | CPU of one core (of 8) |
 |-------|------------------------|
@@ -245,22 +299,31 @@ With the headset in use and streaming PC VR through its dongle, the same uplink 
 
 ## Build, deploy, start
 
-Cross-compile on the desktop (cmake from the system PATH, for libopus and aws-lc):
+Cross-compile on any Linux machine with rustup, zig, cargo-zigbuild, cmake and a C
+compiler (cmake builds libopus; `rust-toolchain.toml` brings the aarch64 target;
+`nix develop` provides all of it on Nix, and is the only thing the flake is for):
 
-    nix shell nixpkgs#cargo-zigbuild nixpkgs#zig -c \
-      cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.39 -p framelight
+    cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.39 -p framelight
 
-The result links only libc and libm: openvr_api, vulkan and libpulse are dlopen'd;
+The result links only libc and libm: openvr_api, vulkan, libpulse and the window's X11
+and GL libraries are dlopen'd;
 libopus and the crypto (aws-lc-rs, the only C besides opus) are static.
 
-Deploy by `scp` into `/home/steamos/framelight/` (never overwrite a running binary in
-place: copy to `.new` and `mv`), together with `tools/headset/framelight-app.sh`. No
-sudo, no system changes, no `systemctl enable`.
+Release builds come from CI instead (`.github/workflows/release.yml`, on a `v*` tag):
+a native arm64 build on Ubuntu 24.04, whose glibc is the headset's 2.39.
 
-To get the switch into the headset's app list, copy `tools/headset/framelight.desktop`
-to `~/.local/share/applications/` on the headset; Steam shows it next to Firefox and
-Telegram as "framelight". Its log is `/home/steamos/framelight/app.log` (the previous
-run's is `app.log.1`).
+`packaging/dist.sh BINARY OUTDIR` packs the binary, `packaging/framelight-app.sh` and
+the icon into `framelight-aarch64-linux.tar.gz`. `packaging/install.sh` (attached to
+every release) downloads that archive, or takes a local one as its argument, unpacks it
+into `~/.local/share/framelight/` and writes `~/.local/share/applications/framelight.desktop`
+with absolute paths; Steam lists it next to Firefox and Telegram as "framelight". Files
+are copied to `.new` and moved over, so a running binary is never overwritten in place.
+No sudo, no system changes, no `systemctl enable`. `install.sh --uninstall` removes both.
+
+The app's log is `~/.local/share/framelight/app.log` (the previous run's is `app.log.1`).
+
+The icon is `assets/framelight.svg`; `assets/framelight.png` is it rendered at 512 px
+(`rsvg-convert -w 512 -h 512`).
 
 ## Workspace layout
 
@@ -275,10 +338,13 @@ run's is `app.log.1`).
   receive, stop signal), `hub`, `viewer`, `pump`, `adapt` (bitrate), `clock` (audio
   timeline), `h264` (SPS and SDP profile parsing), `page.html`.
 - `crates/framelight` — the headset binary: `source` (capture + encode as a
-  `VideoSource`), `ui` (the window), `signals`, `cli`, `probe`, `selftest`.
+  `VideoSource`), `ui` (the window: the eframe app, with `ui/view` for what it shows and
+  `ui/theme` for how it looks), `signals`, `cli`, `probe`, `selftest`.
 - `crates/fl-devhost` — desktop dev host: ffmpeg test pattern, monitor/tone audio.
 - `tools/e2e` — headless-Chromium test of a running streamer.
-- `tools/headset` — the launcher and its desktop entry, and a CPU measuring helper.
+- `packaging` — the launcher, the release archive script and the installer.
+- `assets` — the icon, and `assets/fonts`: the window's fonts with their OFL texts.
+- `tools/headset` — a CPU measuring helper.
 - `tools/vicodec-vm` — the self-test and a probe against the kernel's vicodec in a VM.
 
 ## Interface between halves
@@ -301,8 +367,11 @@ stop() }`. Rules the streamer relies on:
 ## Tests
 
 - `cargo test`, `cargo clippy --all-targets`: SDP/SPS parsing, payload type choice,
-  bitrate control, clocks, HTTP parsing and routing, command-line parsing, the
-  window's layout at the headset's sizes.
+  bitrate control, clocks, HTTP parsing and routing, command-line parsing, and the
+  window run headless with `egui_kittest` (no display, no GPU): in both themes and at
+  1920x1080, 1280x720 and 800x600 every line is inside the window, none overlaps
+  another or the button, the button is where it was in every state, a long address
+  shrinks to fit, and a click, Return or space presses the button once.
 - `crates/fl-webrtc/tests/loopback.rs` (part of `cargo test`, 12 s): the whole
   streamer over 127.0.0.1 with str0m playing the browser and fake sources. Offer and
   answer, ICE, DTLS, a first frame that is a keyframe with its SPS, two viewers on one
@@ -312,7 +381,7 @@ stop() }`. Rules the streamer relies on:
   encoder, GPU or sound.
 - End to end on the desktop: `cargo run -p fl-devhost -- --audio tone`, then
   `node tools/e2e/browser-test.mjs http://<LAN address>:8090/ --tabs 2 --bitrate 3000
-  --chromium $(nix build --no-link --print-out-paths nixpkgs#chromium)/bin/chromium`.
+  --chromium /path/to/chromium` (any Chromium; `nix develop` puts one on PATH).
   It opens the page in headless Chromium (muted at the browser level, throwaway
   profile), and reports frames decoded, time to first frame, the negotiated codec line,
   audio energy and the server's status; it fails if a tab decoded nothing. Use the LAN
@@ -320,8 +389,11 @@ stop() }`. Rules the streamer relies on:
 - The same script against the headset (`http://frame.local:8090/`).
 - `tools/vicodec-vm/run-vm.sh`: `framelight selftest` (the shader's output compared
   byte for byte with a CPU reference; one packet per frame) and a synthetic `probe`
-  against vicodec with lavapipe, in a throwaway NixOS VM.
-- The window: `Xvfb` + `xdotool` (click, Return) + a screenshot.
+  against vicodec with lavapipe, in a throwaway NixOS VM. Optional, and the one tool
+  here that needs Nix.
+- The window, by hand: `Xvfb` + `xdotool` (click, `windowfocus` then Return) + a
+  screenshot; Mesa's llvmpipe does for a driver. On NixOS a cargo-built binary needs
+  `LD_LIBRARY_PATH` to find the X11 and GL libraries it dlopens.
 
 ## Compared with SFRecorder (GPL-3)
 

@@ -15,7 +15,11 @@ fl-capture = { path = "../fl-capture" }
 fl-webrtc = { path = "../fl-webrtc" }
 fl-audio = { path = "../fl-audio" }
 libc = "0.2"
-# The switch window: X11 spoken directly over the socket (no libX11/libxcb on the
-# device) and an 8x8 bitmap font compiled in.
-x11rb = { version = "0.13", default-features = false }
-font8x8 = { version = "0.3", default-features = false }
+# The switch window. OpenGL through glow (no wgpu); winit and glutin dlopen libX11,
+# libxkbcommon, libEGL and libGL, so the binary still links none of them. X11 only:
+# gamescope gives its clients nothing else. The fonts are bundled, hence no defaults.
+eframe = { version = "0.37", default-features = false, features = ["glow", "x11"] }
+
+[dev-dependencies]
+# Runs the window's UI headless (no display, no GPU) and exposes what it laid out.
+egui_kittest = "0.37"

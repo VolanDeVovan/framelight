@@ -1,0 +1,48 @@
+name: Release
+
+# Push a tag that matches the workspace version (v0.1.0 for 0.1.0) to publish.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Native arm64 on Ubuntu 24.04: glibc 2.39, the same as SteamOS on the Frame,
+    # so the binary needs no newer symbols than the headset has.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag matches the workspace version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME" \
+            || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
+
+      # cmake (preinstalled) builds the static libopus.
+      - run: cargo build --release --locked -p framelight
+
+      # openvr_api, vulkan, libpulse and the window's X11 and GL libraries are
+      # dlopen'd at run time; anything linked here would have to exist on the headset.
+      - name: Links nothing the headset might lack
+        run: |
+          needed=$(readelf -d target/release/framelight | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')
+          echo "$needed"
+          echo "$needed" | grep -vxE 'libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|ld-linux-aarch64\.so\.1' \
+            && { echo "unexpected shared library"; exit 1; } || true
+
+      - run: packaging/dist.sh target/release/framelight dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp packaging/install.sh dist/
+          (cd dist && sha256sum framelight-aarch64-linux.tar.gz install.sh > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" --generate-notes \
+            dist/framelight-aarch64-linux.tar.gz dist/install.sh dist/SHA256SUMS

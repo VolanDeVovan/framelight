@@ -1,11 +1,11 @@
 //! SIGINT, SIGTERM and SIGUSR1 as a descriptor to sleep on.
 //!
-//! The signals are blocked and read from a signalfd, so a thread can wait for them
-//! together with a socket in one `poll`, without a timer and without the window between
-//! "checked the flag" and "went to sleep" that a flag set by a handler leaves open.
+//! The signals are blocked and read from a signalfd, so a thread can sleep until one
+//! arrives, without a timer and without the window between "checked the flag" and
+//! "went to sleep" that a flag set by a handler leaves open.
 
 use anyhow::{Result, bail};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
@@ -41,18 +41,13 @@ impl Signals {
         }
     }
 
-    /// For `poll`: readable when a signal is pending.
-    pub fn fd(&self) -> RawFd {
-        self.0.as_raw_fd()
-    }
-
     /// A pending signal, without waiting.
-    pub fn try_next(&self) -> Option<Signal> {
+    fn try_next(&self) -> Option<Signal> {
         // SAFETY: reads one signalfd_siginfo into a zeroed, correctly sized struct.
         let signo = unsafe {
             let mut info: libc::signalfd_siginfo = std::mem::zeroed();
             let n = libc::read(
-                self.fd(),
+                self.0.as_raw_fd(),
                 (&raw mut info).cast(),
                 size_of::<libc::signalfd_siginfo>(),
             );
@@ -68,21 +63,24 @@ impl Signals {
         })
     }
 
-    /// Sleeps until SIGINT or SIGTERM arrives.
-    pub fn wait_for_stop(&self) {
+    /// Sleeps until a signal arrives.
+    pub fn wait(&self) -> Signal {
         loop {
-            while let Some(signal) = self.try_next() {
-                if signal == Signal::Stop {
-                    return;
-                }
+            if let Some(signal) = self.try_next() {
+                return signal;
             }
             let mut pfd = libc::pollfd {
-                fd: self.fd(),
+                fd: self.0.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
             // SAFETY: one valid pollfd; no timeout.
             unsafe { libc::poll(&mut pfd, 1, -1) };
         }
+    }
+
+    /// Sleeps until SIGINT or SIGTERM arrives.
+    pub fn wait_for_stop(&self) {
+        while self.wait() != Signal::Stop {}
     }
 }
