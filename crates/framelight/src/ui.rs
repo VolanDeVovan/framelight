@@ -132,7 +132,14 @@ impl eframe::App for Switch<'_> {
         }
         while let Ok(signal) = self.signals.try_recv() {
             match signal {
-                Signal::Stop => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Signal::Stop => {
+                    tracing::info!("stopped by a signal");
+                    // eframe acts on a close request in the pass after the one that
+                    // asked for it. With the window hidden (the headset not worn)
+                    // nothing else asks for that pass, so ask here.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ctx.request_repaint();
+                }
                 Signal::Toggle => {
                     tracing::info!("button pressed by SIGUSR1");
                     self.toggle();
