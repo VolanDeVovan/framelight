@@ -30,7 +30,7 @@ curl -fsSL https://github.com/VolanDeVovan/framelight/releases/latest/download/i
 
 ## Use
 
-1. Open **framelight** from the app list and press **Enable**. The window shows the
+1. Open **Framelight** from the app list and press **Enable**. The window shows the
    address to open and how many people are watching.
 2. On a TV, phone or computer on the same network, open that address
    (the IP address shown in the window, or `http://steamos.local:8090`).

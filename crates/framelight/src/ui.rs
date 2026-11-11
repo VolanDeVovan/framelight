@@ -30,7 +30,7 @@ pub fn run(streamer: &Streamer, signals: Signals) -> Result<()> {
         // WM_CLASS, which the desktop entry's StartupWMClass names, is not set here:
         // on X11 winit takes it from the name of the binary.
         viewport: egui::ViewportBuilder::default()
-            .with_title("framelight")
+            .with_title("Framelight")
             .with_inner_size([1280.0, 720.0]),
         // The palette is flat colours; keep them exact.
         dithering: false,

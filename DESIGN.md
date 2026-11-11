@@ -316,7 +316,7 @@ a native arm64 build on Ubuntu 24.04, whose glibc is the headset's 2.39.
 the icon into `framelight-aarch64-linux.tar.gz`. `packaging/install.sh` (attached to
 every release) downloads that archive, or takes a local one as its argument, unpacks it
 into `~/.local/share/framelight/` and writes `~/.local/share/applications/framelight.desktop`
-with absolute paths; Steam lists it next to Firefox and Telegram as "framelight". Files
+with absolute paths; Steam lists it next to Firefox and Telegram as "Framelight". Files
 are copied to `.new` and moved over, so a running binary is never overwritten in place.
 No sudo, no system changes, no `systemctl enable`. `install.sh --uninstall` removes both.
 

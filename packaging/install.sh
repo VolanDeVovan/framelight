@@ -67,7 +67,7 @@ done
 cat >"$ENTRY.new" <<EOF
 [Desktop Entry]
 Type=Application
-Name=framelight
+Name=Framelight
 Comment=Stream the Headset View to browsers on the network
 Exec=$APP/framelight-app.sh
 Icon=$APP/framelight.png
@@ -82,6 +82,6 @@ command -v update-desktop-database >/dev/null 2>&1 &&
 installed=$("$APP/framelight" version 2>/dev/null || echo framelight)
 say ""
 say "Installed $installed into $APP"
-say "Open \"framelight\" from the app list, press Enable, then open"
+say "Open \"Framelight\" from the app list, press Enable, then open"
 say "  http://$(cat /proc/sys/kernel/hostname 2>/dev/null || echo steamos).local:8090"
 say "in a browser on a TV or computer on the same network."
